@@ -11,4 +11,6 @@ py shfs.py
 ```
 And do the same thing as above.  
 
+Press `CTRL+C` to stop the program.  
+
 This program doesn't work on Python 3.13.

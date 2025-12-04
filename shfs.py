@@ -24,8 +24,8 @@ PORT = 9999 # baka baka
 # change this to whatever path you like, for example:
 # DIRECTORY = "C:\Users\User\Desktop\"
 # set it to "." to use current working directory instead (this folder)
-# DIRECTORY = os.getenv("FOLDER")
-DIRECTORY = "."
+DIRECTORY = os.getenv("FOLDER")
+# DIRECTORY = "."
 if DIRECTORY and os.path.isdir(DIRECTORY):
 	os.chdir(DIRECTORY)
 else:
@@ -44,7 +44,7 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 		return None
 
 
-	# Override list_directory to inject your custom HTML for all dirs
+	# inject custom html to directory path
 	def list_directory(self, path):
 		try:
 			listdir = os.listdir(path)
@@ -232,7 +232,7 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 					self.send_header("Location", self.path)
 					self.end_headers()
 					return
-		
+
 		self.send_response(400)
 		self.end_headers()
 		self.wfile.write(b"No valid file selected")
