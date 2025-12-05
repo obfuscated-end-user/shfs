@@ -13,12 +13,16 @@ import time
 import urllib
 import html
 import io
+import base64
 
 from dotenv import load_dotenv
 
 load_dotenv()
+USERNAME = os.getenv("HTTP_USER", "admin")
+PASSWORD = os.getenv("HTTP_PASS", "secret")
+CREDENTIALS = base64.b64encode(f"{USERNAME}:{PASSWORD}".encode()).decode()
 
-IPV4_ADDRESS = os.getenv("IP_ADD")
+IPV4_ADDRESS = os.getenv("IP_ADDR")
 PORT = 9999 # baka baka
 # target folder for uploads
 # change this to whatever path you like, for example:
@@ -34,29 +38,67 @@ SERVER_DIRECTORY_IP_AND_PORT = f"{IPV4_ADDRESS}:{PORT}/"
 
 """
 to-do
-- add a password
+- add a password X
 - visually remove this file in root (NOT DELETE)
+- download a directory but compress it first
+- checkbox and zip for multi-download with the name of the directory
+- ui looks like crap on desktop
+- move the up one level and root buttons closer to the table X
+- add a file and directory count, and total items somewhere X
+- show the list of the files to be uploaded instead of being crammed like that
+- uploading a file to folders other than the root is broken X
+- show "nothing to see here" inside empty directories when opened
+- any file named exactly "index.html" can't be opened
 """
 
 class UploadHandler(http.server.SimpleHTTPRequestHandler):
+	def do_AUTHHEAD(self):
+		self.send_response(401)
+		self.send_header("WWW-Authenticate", 'Basic realm="File repository"')
+		self.send_header("Content-type", "text/html")
+		self.end_headers()
+
+
+	def check_auth(self):
+		auth_header = self.headers.get("Authorization")
+		return auth_header == f"Basic {CREDENTIALS}"
+
 
 	def index_path(self, path):
 		return None
 
 
+	def require_auth(self):
+		if not self.check_auth():
+			self.do_AUTHHEAD()
+			self.wfile.write(b'<h1>Access Denied >:)</h1>')
+			return False
+		return True
+
+
 	# inject custom html to directory path
 	def list_directory(self, path):
+		if not self.require_auth():
+			return None
+
 		try:
 			listdir = os.listdir(path)
+			num_files = sum(1 for item in listdir if os.path.isfile(os.path.join(path, item)))
+			num_dirs = sum(1 for item in listdir if os.path.isdir(os.path.join(path, item)))
+			total_items = len(listdir)
+			total_size_bytes = sum(os.path.getsize(os.path.join(path, item)) for item in listdir if os.path.isfile(os.path.join(path, item)))
+			total_size_str = self.format_size(total_size_bytes)
 		except OSError:
 			self.send_error(404, "No permission to list directory")
 			return None
 		
-		listdir.sort(key=lambda x: (not os.path.isdir(os.path.join(path, x)), x.lower()))
+		listdir.sort(
+			key=lambda x: (not os.path.isdir(os.path.join(path, x)), x.lower()))
 		f = io.BytesIO()
 		displaypath = html.escape(urllib.parse.unquote(self.path))
 
 		# move these to a separate html file?
+		# 2025/12/05 - don't
 		f.write(b"""
 		<!DOCTYPE html>
 		<html>
@@ -66,23 +108,52 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 				<link rel="icon" type="image/x-icon" href="https://img.icons8.com/?size=100&id=kktvCbkDLbNb&format=png&color=000000">
 				<title>files on """ + SERVER_DIRECTORY_IP_AND_PORT.encode() + b"""</title>
 				<style>
-					body { font-family: monospace; font-size:14px; max-width:600px; margin:auto; padding:20px; }
-					input[type=file], input[type=submit] { font-size:18px; padding:10px; width:50%; margin:10px 0;}
-					#fileTable { width:100%; border-collapse: collapse; }
-					th { padding:10px; border:1px solid #ccc; cursor:pointer; background:#f0f0f0; }
-					td { border:1px solid black; padding:8px; vertical-align: top; }
-					.scrollable-cell { max-width: 250px; overflow-x: auto; white-space: nowrap; }
+					body {
+						font-family: monospace;
+						font-size: 14px;
+						max-width: 600px;
+						margin: auto;
+						padding: 20px;
+					}
+					input[type=file], input[type=submit] {
+						font-size: 18px;
+						padding: 10px;
+						width: 50%;
+						margin: 10px 0;
+					}
+					#fileTable {
+						width: 100%;
+						border-collapse: collapse;
+					}
+					th {
+						padding:10px;
+						border:1px solid #ccc;
+						cursor:pointer;
+						background:#f0f0f0;
+					}
+					td {
+						border:1px solid black;
+						padding:8px;
+						vertical-align: top;
+					}
+					.scrollable-cell {
+						max-width: 250px;
+						overflow-x: auto;
+						white-space: nowrap;
+					}
 				</style>
 				<script>
 					function toggleUpload() {
-						const fileInput = document.getElementById('fileInput');
-						const uploadBtn = document.getElementById('uploadBtn');
+						const fileInput = document.getElementById("fileInput");
+						const uploadBtn = document.getElementById("uploadBtn");
 						uploadBtn.disabled = fileInput.files.length === 0;
 						uploadBtn.textContent = fileInput.files.length > 0 ? 
-							`Upload ${fileInput.files.length} file(s)` : 'Upload Files';
+							`Upload ${fileInput.files.length} file(s)` : "Upload files";
 					}
 
+					// this doesn't seem to work
 					function sortTable(n) {
+						let shouldSwitch = false;
 						let table = document.getElementById("fileTable");
 						let switching = true;
 						let dir = "asc";
@@ -91,29 +162,48 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 							let rows = table.rows;
 							for (let i = 1; i < (rows.length - 1); i++) {
 								let shouldSwitch = false;
-								let x = rows[i].getElementsByTagName("TD")[n];
-								let y = rows[i + 1].getElementsByTagName("TD")[n];
-								if(dir === "asc" && x.innerHTML.toLowerCase() > y.innerHTML.toLowerCase()) {
-									shouldSwitch = true; break;
+								let x = rows[i].getElementsByTagName("td")[n];
+								let y = rows[i + 1].getElementsByTagName("td")[n];
+								console.log("retard");
+								if (
+									dir === "asc" && x.innerHTML.toLowerCase() >
+									y.innerHTML.toLowerCase()
+								) {
+									shouldSwitch = true;
+									break;
 								}
-								if(dir === "desc" && x.innerHTML.toLowerCase() < y.innerHTML.toLowerCase()) {
-									shouldSwitch = true; break;
+									
+								if (dir === "desc" && x.innerHTML.toLowerCase()
+									< y.innerHTML.toLowerCase()
+								) {
+									shouldSwitch = true;
+									break;
 								}
 							}
 							if (shouldSwitch) {
 								rows[i].parentNode.insertBefore(rows[i+1], rows[i]);
 								switching = true;
 							} else {
-								if(dir === "asc") dir = "desc"; else dir = "asc";
+								if (dir === "asc")
+									dir = "desc";
+								else
+									dir = "asc";
 							}
 						}
 					}
 				</script>
 			</head>
 			<body>
+				<form method="post" enctype="multipart/form-data" action=".">
+					<input type="file" id="fileInput" name="file" multiple onchange="toggleUpload()">
+					<input type="submit" id="uploadBtn" value="Upload files" disabled>
+				</form>
 		""")
+
+		f.write(f"<h3>📁 root{displaypath}</h3>".encode())
+
 		if self.path == "/" or self.path.strip("/") == "":
-			f.write('<div style="margin-bottom: 20px;"><strong>root dir</strong></div>'.encode('utf-8'))
+			pass
 		else:
 			# remove trailing slash and split by "/"
 			parts = [p for p in self.path.strip("/").split("/") if p]
@@ -125,22 +215,29 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 			if parent_http == "//":
 				parent_http = "/"
 
-			f.write(f'<div style="margin-bottom: 20px;">'
-				f'<a href="{parent_http}" style="display:inline-block;padding:10px 15px;background:#ddd;margin-right:10px;text-decoration:none;border-radius:4px;">up one level</a>'
-				f'<a href="/" style="display:inline-block;padding:10px 15px;background:#007cba;color:white;text-decoration:none;border-radius:4px;">go to root</a>'
-				f'</div>'.encode('utf-8'))
+			f.write(f"""
+				<div style="margin-bottom: 20px;">
+					<a href="{parent_http}" style="display:inline-block;padding:10px 15px;background:#ddd;margin-right:10px;text-decoration:none;border-radius:4px;">up one level</a>
+					<a href="/" style="display:inline-block;padding:10px 15px;background:#007cba;color:white;text-decoration:none;border-radius:4px;">go to root</a>
+				</div>""".encode("utf-8")
+			)
+# {total_size_str}
+		directory_info = f"""
+			<ul>
+				<li>Directories: <b>{num_dirs}</b></li>
+				<li>Files: <b>{num_files}</b></li>
+				<li>Total items: <b>{total_items}</b></li>
+				<li>Total size: <b>{total_size_str} ({total_size_bytes:,} bytes)</b></li>
+			</ul>""".encode()
 
-		f.write(f"<h1>📁 {displaypath or 'home'}</h1>".encode())
-		f.write(b"""
-		<form method="post" enctype="multipart/form-data" action=".">
-			<input type="file" id="fileInput" name="file" multiple onchange="toggleUpload()">
-			<input type="submit" id="uploadBtn" value="Upload files" disabled>
-		</form>
-		<table id="fileTable">
-			<thead>
-				<tr><th onclick="sortTable(0)">Name</th><th onclick="sortTable(1)">Modified</th><th onclick="sortTable(2)">Size</th></tr>
-			</thead>
-		<tbody>""")
+		f.write(directory_info + b"""
+			<div><b>refresh the page if changes do not reflect across devices</b></div>
+			<table id="fileTable">
+				<thead>
+					<tr><th onclick="sortTable(0)">Name</th><th onclick="sortTable(1)">Modified</th><th onclick="sortTable(2)">Size</th></tr>
+				</thead>
+			<tbody>"""
+		)
 
 		for item in listdir:
 			fullname = os.path.join(path, item)
@@ -148,13 +245,27 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 			mod_date = time.strftime('%Y-%m-%d %H:%M', time.localtime(mod_time))
 
 			if os.path.isdir(fullname):
-				f.write(f'<tr><td class="scrollable-cell">📁 <a href="{urllib.parse.quote(item)}/">{item}/</a></td>'.encode())
-				f.write(f'<td>{mod_date}</td><td>-</td></tr>'.encode())
+				f.write(f"""
+					<tr>
+						<td><div class="scrollable-cell">📁 <a href="{
+							urllib.parse.quote(item)}/">{item}/</a>
+						</div></td>
+						<td>{mod_date}</td>
+						<td>-</td>
+					</tr>""".encode()
+				)
 			elif os.path.isfile(fullname):
 				emoji = self.get_file_emoji(item)
 				size = self.format_size(os.path.getsize(fullname))
-				f.write(f'<tr><td><div class="scrollable-cell">{emoji} <a href="{urllib.parse.quote(item)}">{item}</a></div></td>'.encode())
-				f.write(f'<td>{mod_date}</td><td>{size}</td></tr>'.encode())
+				f.write(f"""
+					<tr>
+						<td><div class="scrollable-cell">{emoji} 
+							<a href="{urllib.parse.quote(item)}">{item}</a>
+						</div></td>
+						<td>{mod_date}</td>
+						<td>{size}</td>
+					</tr>""".encode()
+				)
 
 		f.write(b"</tbody></table></body></html>")
 		
@@ -171,6 +282,9 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 
 	def send_head(self):
 		"""Serve a file or force directory listing even if index.html exists."""
+
+		if not self.require_auth():
+			return None
 
 		# translate URL path to local filesystem path
 		path = self.translate_path(self.path)
@@ -202,7 +316,10 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 			self.send_header("Content-type", ctype)
 			self.send_header("Content-Length", str(fs[6]))
 			# Last-Modified header
-			self.send_header("Last-Modified", self.date_time_string(fs.st_mtime))
+			self.send_header(
+				"Last-Modified",
+				self.date_time_string(fs.st_mtime)
+			)
 			self.end_headers()
 			return f
 		except:
@@ -211,12 +328,19 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 
 
 	def do_POST(self):
+		if not self.require_auth():
+			return None
+
 		# get the actual directory path from request
-		dir_path = urllib.parse.unquote_plus(self.path.rstrip('/'))
-		if not dir_path or dir_path == '/':
-			dir_path = '.'
+		dir_path = self.translate_path(urllib.parse.unquote(self.path))
+		if not dir_path or not os.path.isdir(dir_path):
+			dir_path = "."  # fallback to current working directory if invalid
 		
-		form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD":"POST"})
+		form = cgi.FieldStorage(
+			fp=self.rfile,
+			headers=self.headers,
+			environ={"REQUEST_METHOD":"POST"}
+		)
 		
 		if "file" in form:
 			file_item = form["file"]
@@ -239,6 +363,9 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 
 
 	def do_GET(self):
+		if not self.require_auth():
+			return None
+
 		# normalize abnd decode path
 		parsed = urllib.parse.urlsplit(self.path)
 		path_unquoted = urllib.parse.unquote(parsed.path)
@@ -260,7 +387,8 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 			return
 
 		# only force plain-text for ACTUAL text documents
-		text_ext = (".txt", ".md", ".log", ".ini", ".cfg", ".conf")
+		# "LICENSE" and "LICENCE" are for the license files commonly found in git repositories
+		text_ext = (".txt", ".md", ".log", ".ini", ".cfg", ".conf", ".env", ".lrc", "LICENSE", "LICENCE")
 
 		if self.path.endswith(text_ext):
 			try:
@@ -270,7 +398,10 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 						content = f.read()
 
 					self.send_response(200)
-					self.send_header("Content-type", "text/plain; charset=utf-8")
+					self.send_header(
+						"Content-type",
+						"text/plain; charset=utf-8"
+					)
 					self.end_headers()
 					self.wfile.write(content.encode("utf-8"))
 					return
@@ -299,55 +430,81 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 		# for example, both mpeg transport streams and typescript files use the ".ts" extension
 		mapping = {
 			"image": {
-				".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".svg",
-				".tiff", ".tif", ".ico", ".heif", ".jfif", ".raw"
+				".png", ".jpg", ".jpeg", ".gif",
+				".bmp", ".webp", ".svg", ".tiff",
+				".tif", ".ico", ".heif", ".jfif",
+				".raw"
 			},
 			"video": {
-				".mp4", ".mkv", ".mov", ".wmv", ".flv", ".avi", ".webm", ".m4v",
+				".mp4", ".mkv", ".mov", ".wmv",
+				".flv", ".avi", ".webm", ".m4v",
 				".3gp", ".mpeg", ".mpg"
 			},
-			"music": {
-				".mp3", ".flac", ".alac", ".ogg", ".wav", ".ape", ".aac", ".wma",
-				".midi", ".m4a"
+			"audio": {
+				".mp3", ".flac", ".alac", ".ogg",
+				".wav", ".ape", ".aac", ".wma",
+				".midi", ".m4a", ".3gpp"
 			},
 			"doc": {
-				".pdf", ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt", ".epub",
-				".odt", ".ods", ".odp", ".csv", ".tex", ".md"
+				".pdf", ".docx", ".doc", ".xlsx",
+				".xls", ".pptx", ".ppt", ".epub",
+				".odt", ".ods", ".odp", ".tex",
+				".accdb"
 			},
 			"text": {
-				".txt", ".rtf", ".md"
+				".txt", ".rtf", ".md", ".csv",
+				".lrc", ".srt", ".ass"
 			},
 			"archive": {
-				".zip", ".rar", ".tar", ".7z", ".gz", ".bz2", ".xz", ".iso", ".lzma",
-				".cab", ".apk"
+				".zip", ".rar", ".tar", ".7z",
+				".gz", ".bz2", ".xz", ".iso",
+				".lzma", ".cab"
 			},
 			"code": {
-				".py", ".js", ".java", ".c", ".cpp", ".cs", ".rb", ".php", ".html",
-				".css", ".json", ".xml", ".sh", ".bat", ".pl", ".go", ".swift", ".ts", ".tsx"
+				".py", ".js", ".java", ".c",
+				".cpp", ".cs", ".rb", ".php",
+				".html", ".css", ".json", ".xml",
+				".sh", ".bat", ".pl", ".go",
+				".swift", ".ts", ".tsx", ".pyw"
 			},
 			"config": {
-				".ini", ".cfg", ".conf", ".config", ".yaml", ".yml", ".toml", ".properties"
+				".ini", ".cfg", ".conf", ".config",
+				".yaml", ".yml", ".toml", ".properties"
 			},
 			"exe": {
-				".exe", ".dll", ".bin", ".cmd", ".com", ".msi", ".apk", ".app", ".deb",
-				".rpm", ".iso", ".sys"
+				".exe", ".dll", ".bin", ".cmd",
+				".com", ".msi", ".apk", ".app",
+				".deb", ".rpm", ".iso", ".sys"
 			},
 			"font": {
-				".ttf", ".otf", ".woff", ".woff2", ".eot"
+				".ttf", ".otf", ".woff", ".woff2",
+				".eot"
+			},
+			"rom": {
+				".nes", ".smc", ".sfc",	# NES/SNES (existing)
+				".gba", ".gbc", ".gb",	# Game Boy family
+				".md", ".bin", ".gen",	# Sega Genesis/Mega Drive
+				".sms", ".gg",			# Sega Master System/Game Gear
+				".pce", ".sgx",			# PC Engine/TurboGrafx-16
+				".nds", ".n64", ".z64",	# Nintendo DS/N64
+				".psx", ".pbp", ".cue",	# PlayStation 1 (cue is ambiguous)
+				".vb", ".lnx",			# Virtual Boy, Atari Lynx
+				".ws", ".wsc", ".ngp",	# WonderSwan, Neo Geo Pocket
 			}
 		}
 
 		emoji_map = {
 			"image":	"🖼️",
 			"video":	"🎥",
-			"music":	"🎵",
+			"audio":	"🎵",
 			"doc":		"📕",
 			"text":		"📄",
 			"archive":	"📦",
 			"code":		"📜", # because "script"
 			"config":	"⚙️",
 			"exe":		"💻",
-			"font":		"🔤"
+			"font":		"🔤" ,
+			"rom":		"💿" 
 		}
 
 		for category, extensions in mapping.items():

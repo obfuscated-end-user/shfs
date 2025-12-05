@@ -7,7 +7,7 @@ Double click the file and open the link provided on your browser.
 
 Another way is to go to the folder where the program is located, open the terminal there, and type:
 ```
-py shfs.py
+python shfs.py
 ```
 And do the same thing as above.  
 
