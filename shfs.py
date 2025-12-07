@@ -22,8 +22,8 @@ import functools
 from dotenv import load_dotenv
 
 load_dotenv()
-USERNAME = os.getenv("HTTP_USER", "admin")
-PASSWORD = os.getenv("HTTP_PASS", "secret")
+USERNAME = os.getenv("HTTP_USER")
+PASSWORD = os.getenv("HTTP_PASS")
 CREDENTIALS = base64.b64encode(f"{USERNAME}:{PASSWORD}".encode()).decode()
 
 IPV4_ADDRESS = os.getenv("IP_ADDR")
@@ -58,6 +58,7 @@ done/implemented
 - download a directory but compress it first
 """
 
+# change class name because that's not what it even does and i don't know why you stuck with that
 class UploadHandler(http.server.SimpleHTTPRequestHandler):
 	def __init__(self, *args, **kwargs):
 		super().__init__(*args, **kwargs)
@@ -75,21 +76,113 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 		self.end_headers()
 
 
-	def check_auth(self):
-		auth_header = self.headers.get("Authorization")
-		return auth_header == f"Basic {CREDENTIALS}"
+	def do_POST(self):
+		if not self.require_auth():
+			return None
+
+		# get the actual directory path from request
+		dir_path = self.translate_path(urllib.parse.unquote(self.path))
+		if not dir_path or not os.path.isdir(dir_path):
+			dir_path = "."  # fallback to current working directory if invalid
+		
+		form = cgi.FieldStorage(
+			fp=self.rfile,
+			headers=self.headers,
+			environ={"REQUEST_METHOD":"POST"}
+		)
+		
+		if "file" in form:
+			file_item = form["file"]
+			if file_item.filename and file_item.file:
+				filename = os.path.basename(file_item.filename.strip())
+				if filename:
+					filepath = os.path.join(dir_path, filename)
+					os.makedirs(os.path.dirname(filepath), exist_ok=True)
+					with open(filepath, "wb") as f:
+						f.write(file_item.file.read())
+
+					self.send_response(303)
+					self.send_header("Location", self.path)
+					self.end_headers()
+					return
+
+		self.send_response(400)
+		self.end_headers()
+		self.wfile.write(b"No valid file selected")
 
 
-	def index_path(self, path):
-		return None
+	def do_GET(self):
+		if not self.require_auth():
+			return None
 
+		# normalize abnd decode path
+		parsed = urllib.parse.urlsplit(self.path)
+		path_unquoted = urllib.parse.unquote(parsed.path)
+		query_params = urllib.parse.parse_qs(parsed.query)
+		# basename = os.path.basename(path_unquoted.rstrip("/")).lower()
 
-	def require_auth(self):
-		if not self.check_auth():
-			self.do_AUTHHEAD()
-			self.wfile.write(b'<h1>Access Denied >:)</h1>')
-			return False
-		return True
+		# check for dir dl request
+		# clean_path = path_unquoted.rstrip("/")
+		if query_params.get("download") and os.path.isdir(self.translate_path(path_unquoted.rstrip("/"))):
+			return self.serve_directory_zip(path_unquoted.rstrip("/"))
+
+		# load index.html
+		""" if basename == "index.html" and os.path.isfile(self.translate_path(self.path)):
+			pass """
+
+		# only force plain-text for ACTUAL text documents
+		# "LICENSE" and "LICENCE" are for the license files commonly found in git repositories
+		text_ext = (".txt", ".md", ".log", ".ini", ".cfg", ".conf", ".env", ".lrc", "LICENSE", "LICENCE")
+
+		if self.path.endswith(text_ext):
+			try:
+				localpath = self.translate_path(self.path)
+				if os.path.isfile(localpath):
+					with open(localpath, "r", encoding="utf-8") as f:
+						content = f.read()
+
+					self.send_response(200)
+					self.send_header(
+						"Content-type",
+						"text/plain; charset=utf-8"
+					)
+					self.end_headers()
+					self.wfile.write(content.encode("utf-8"))
+					return
+
+			except Exception:
+				pass
+
+		result = self.send_head()
+		if result and isinstance(result, tuple):
+			# streaming file (returned as (file, total_size))
+			f, total_size = result
+			# downloaded = 0
+			chunk_size = 64 * 1024	# 64kb chunks
+
+			try:
+				# i think this is the cause why large files download slow as shit
+				for chunk in iter(lambda: f.read(chunk_size), b""):
+					self.connection.sendall(chunk)
+			finally:
+				f.close()
+			return
+		elif result:
+			# regular file (non-chunked)
+			# result.read()
+			# result is a file-lik (e.g. BytesIO from list_directory)
+			try:
+				# copy its content directly to the socket
+				shutil.copyfileobj(result, self.wfile)
+			finally:
+				try:
+					result.close()
+				except Exception:
+					pass
+			return
+
+		# serve EVERYTHING ELSE normally - css, js, html, json, etc
+		return super().do_GET()
 
 
 	# inject custom html to directory path
@@ -343,6 +436,23 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 
 		return f
 
+		# UNREACHABLE STATEMENT
+		try:
+			fs = os.fstat(f.fileno())
+			self.send_response(200)
+			self.send_header("Content-type", ctype)
+			self.send_header("Content-Length", str(fs[6]))
+			# Last-Modified header
+			self.send_header(
+				"Last-Modified",
+				self.date_time_string(fs.st_mtime)
+			)
+			self.end_headers()
+			return f
+		except:
+			f.close()
+			raise
+
 
 	def send_head(self):
 		"""Serve a file or force directory listing even if index.html exists."""
@@ -389,132 +499,6 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 		except OSError:
 			self.send_error(404, "File not found")
 			return None
-
-		# UNREACHABLE STATEMENT
-		try:
-			fs = os.fstat(f.fileno())
-			self.send_response(200)
-			self.send_header("Content-type", ctype)
-			self.send_header("Content-Length", str(fs[6]))
-			# Last-Modified header
-			self.send_header(
-				"Last-Modified",
-				self.date_time_string(fs.st_mtime)
-			)
-			self.end_headers()
-			return f
-		except:
-			f.close()
-			raise
-
-
-	def do_POST(self):
-		if not self.require_auth():
-			return None
-
-		# get the actual directory path from request
-		dir_path = self.translate_path(urllib.parse.unquote(self.path))
-		if not dir_path or not os.path.isdir(dir_path):
-			dir_path = "."  # fallback to current working directory if invalid
-		
-		form = cgi.FieldStorage(
-			fp=self.rfile,
-			headers=self.headers,
-			environ={"REQUEST_METHOD":"POST"}
-		)
-		
-		if "file" in form:
-			file_item = form["file"]
-			if file_item.filename and file_item.file:
-				filename = os.path.basename(file_item.filename.strip())
-				if filename:
-					filepath = os.path.join(dir_path, filename)
-					os.makedirs(os.path.dirname(filepath), exist_ok=True)
-					with open(filepath, "wb") as f:
-						f.write(file_item.file.read())
-
-					self.send_response(303)
-					self.send_header("Location", self.path)
-					self.end_headers()
-					return
-
-		self.send_response(400)
-		self.end_headers()
-		self.wfile.write(b"No valid file selected")
-
-
-	def do_GET(self):
-		if not self.require_auth():
-			return None
-
-		# normalize abnd decode path
-		parsed = urllib.parse.urlsplit(self.path)
-		path_unquoted = urllib.parse.unquote(parsed.path)
-		query_params = urllib.parse.parse_qs(parsed.query)
-		# basename = os.path.basename(path_unquoted.rstrip("/")).lower()
-
-		# check for dir dl request
-		# clean_path = path_unquoted.rstrip("/")
-		if query_params.get("download") and os.path.isdir(self.translate_path(path_unquoted.rstrip("/"))):
-			return self.serve_directory_zip(path_unquoted.rstrip("/"))
-
-		# load index.html
-		""" if basename == "index.html" and os.path.isfile(self.translate_path(self.path)):
-			pass """
-
-		# only force plain-text for ACTUAL text documents
-		# "LICENSE" and "LICENCE" are for the license files commonly found in git repositories
-		text_ext = (".txt", ".md", ".log", ".ini", ".cfg", ".conf", ".env", ".lrc", "LICENSE", "LICENCE")
-
-		if self.path.endswith(text_ext):
-			try:
-				localpath = self.translate_path(self.path)
-				if os.path.isfile(localpath):
-					with open(localpath, "r", encoding="utf-8") as f:
-						content = f.read()
-
-					self.send_response(200)
-					self.send_header(
-						"Content-type",
-						"text/plain; charset=utf-8"
-					)
-					self.end_headers()
-					self.wfile.write(content.encode("utf-8"))
-					return
-
-			except Exception:
-				pass
-
-		result = self.send_head()
-		if result and isinstance(result, tuple):
-			# streaming file (returned as (file, total_size))
-			f, total_size = result
-			# downloaded = 0
-			chunk_size = 64 * 1024	# 64kb chunks
-
-			try:
-				# i think this is the cause why large files download slow as shit
-				for chunk in iter(lambda: f.read(chunk_size), b""):
-					self.connection.sendall(chunk)
-			finally:
-				f.close()
-			return
-		elif result:
-			# regular file (non-chunked)
-			# result.read()
-			# result is a file-lik (e.g. BytesIO from list_directory)
-			try:
-				# copy its content directly to the socket
-				shutil.copyfileobj(result, self.wfile)
-			finally:
-				try:
-					result.close()
-				except Exception:
-					pass
-			return
-
-		# serve EVERYTHING ELSE normally - css, js, html, json, etc
-		return super().do_GET()
 
 
 	def format_size(self, size_bytes):
@@ -693,6 +677,19 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 
 	def write_unbuffered(self, data):
 		self.connection.sendall(data)
+
+
+	def check_auth(self):
+		auth_header = self.headers.get("Authorization")
+		return auth_header == f"Basic {CREDENTIALS}"
+
+
+	def require_auth(self):
+		if not self.check_auth():
+			self.do_AUTHHEAD()
+			self.wfile.write(b'<h1>Access Denied >:)</h1>')
+			return False
+		return True
 
 
 with socketserver.TCPServer((IPV4_ADDRESS, PORT), UploadHandler) as httpd:
