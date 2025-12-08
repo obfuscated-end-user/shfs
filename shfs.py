@@ -4,7 +4,6 @@ Simple HTTP file server.
 TBD
 code looks funky, and needs to be refactored asap
 """
-
 import http.server
 import socketserver
 import cgi
@@ -18,12 +17,20 @@ import zipfile
 import shutil
 import socket
 import functools
+import json
+import ssl
 
 from dotenv import load_dotenv
+
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 
 load_dotenv()
 USERNAME = os.getenv("HTTP_USER")
 PASSWORD = os.getenv("HTTP_PASS")
+DEFAULT_CERT = os.path.join(THIS_DIR, "server.crt")
+DEFAULT_KEY = os.path.join(THIS_DIR, "server.key")
+CERT_FILE = os.path.join(THIS_DIR, os.getenv("SSL_CERT", DEFAULT_CERT))
+CERT_KEY = os.path.join(THIS_DIR, os.getenv("SSL_KEY", DEFAULT_KEY))
 CREDENTIALS = base64.b64encode(f"{USERNAME}:{PASSWORD}".encode()).decode()
 
 IPV4_ADDRESS = os.getenv("IP_ADDR")
@@ -47,6 +54,7 @@ to-do
 - ui looks like crap on desktop
 - show the list of the files to be uploaded instead of being crammed like that
 - make each dir clickable on the root/path/path/... etc
+- how to automatically get valid ipv4 address from ipconfig
 
 done/implemented
 - add a password
@@ -84,13 +92,13 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 		dir_path = self.translate_path(urllib.parse.unquote(self.path))
 		if not dir_path or not os.path.isdir(dir_path):
 			dir_path = "."  # fallback to current working directory if invalid
-		
+
 		form = cgi.FieldStorage(
 			fp=self.rfile,
 			headers=self.headers,
 			environ={"REQUEST_METHOD":"POST"}
 		)
-		
+
 		if "file" in form:
 			file_item = form["file"]
 			if file_item.filename and file_item.file:
@@ -121,6 +129,11 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 		query_params = urllib.parse.parse_qs(parsed.query)
 		# basename = os.path.basename(path_unquoted.rstrip("/")).lower()
 
+		#  check sse first before directory download
+		if query_params.get("sse") and os.path.isdir(self.translate_path(path_unquoted.rstrip("/"))):
+			self.do_SSE(path_unquoted.rstrip("/"))
+			return None
+
 		# check for dir dl request
 		# clean_path = path_unquoted.rstrip("/")
 		if query_params.get("download") and os.path.isdir(self.translate_path(path_unquoted.rstrip("/"))):
@@ -132,7 +145,10 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 
 		# only force plain-text for ACTUAL text documents
 		# "LICENSE" and "LICENCE" are for the license files commonly found in git repositories
-		text_ext = (".txt", ".md", ".log", ".ini", ".cfg", ".conf", ".env", ".lrc", "LICENSE", "LICENCE")
+		text_ext = (
+			".txt", ".md", ".log", ".ini", ".cfg", ".conf", ".env", ".lrc",
+			"LICENSE", "LICENCE"
+		)
 
 		if self.path.endswith(text_ext):
 			try:
@@ -143,9 +159,7 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 
 					self.send_response(200)
 					self.send_header(
-						"Content-type",
-						"text/plain; charset=utf-8"
-					)
+						"Content-type", "text/plain; charset=utf-8")
 					self.end_headers()
 					self.wfile.write(content.encode("utf-8"))
 					return
@@ -154,39 +168,161 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 				pass
 
 		result = self.send_head()
-		if result and isinstance(result, tuple):
-			# streaming file (returned as (file, total_size))
-			f, total_size = result
-			# downloaded = 0
-			chunk_size = 64 * 1024	# 64kb chunks
-
-			try:
-				# i think this is the cause why large files download slow as shit
-				for chunk in iter(lambda: f.read(chunk_size), b""):
-					self.connection.sendall(chunk)
-			finally:
-				f.close()
-			return
-		elif result:
-			# regular file (non-chunked)
-			# result.read()
-			# result is a file-lik (e.g. BytesIO from list_directory)
-			try:
-				# copy its content directly to the socket
-				shutil.copyfileobj(result, self.wfile)
-			finally:
+		if result:
+			# (file, size) - individual file
+			if isinstance(result, tuple):
+				f, total_size = result
 				try:
-					result.close()
-				except Exception:
-					pass
+					# shutil.copyfileobj(f, self.wfile)
+					# microsoft edge case (pun?)
+					self.connection.sendall(f.read())
+					self.wfile.flush()
+				finally:
+					f.close()
+			# directory listing
+			else:
+				try:
+					shutil.copyfileobj(result, self.wfile)
+				finally:
+					try:
+						result.close()
+					except:
+						pass
 			return
 
-		# serve EVERYTHING ELSE normally - css, js, html, json, etc
-		return super().do_GET()
+		# fallback
+		path = self.translate_path(self.path)
+		if os.path.isdir(path):
+			return self.list_directory(path)
+		self.send_error(404, "File not found")
 
 
-	# inject custom html to directory path
+	def do_SSE(self, dir_path):
+		if not self.require_auth():
+			self.do_AUTHHEAD()
+			return None
+
+		path = self.translate_path(dir_path)
+		if not os.path.isdir(path):
+			self.send_error(404, "Directory not found")
+			return None
+
+		# sse headers first
+		self.send_response(200)
+		self.send_header("Content-Type", "text/event-stream")
+		self.send_header("Cache-Control", "no-cache")
+		self.send_header("Connection", "keep-alive")
+		self.send_header("Access-Control-Allow-Origin", "*")
+		self.end_headers()
+
+		# precalculate total things
+		total_size = 0
+		total_files = 0
+		for root, _, files in os.walk(path):
+			for f in files:
+				try:
+					total_size += os.path.getsize(os.path.join(root, f))
+					total_files += 1
+				except:
+					pass
+
+		processed_bytes = 0
+		file_count = 0
+		cancelled = False
+
+
+		def send_progress():
+			nonlocal processed_bytes, file_count
+			progress_data = {
+				"processed_bytes":	processed_bytes,
+				"total_size":		total_size,
+				"file_count":		file_count,
+				"total_files":		total_files,
+				"percent":		min(100, (processed_bytes / total_size * 100)
+									if total_size > 0 else 0)
+			}
+			self.wfile.write(
+				f"data: {json.dumps(progress_data)}\n\n".encode("utf-8"))
+			self.wfile.flush()
+		
+		# check if client dced
+		def client_disconnected():
+			try:
+				self.wfile.write(b"")
+				self.wfile.flush()
+				return False
+			except (BrokenPipeError, ConnectionResetError, OSError):
+				return True
+
+		send_progress()	# initial
+		
+		try:
+			zip_buffer = io.BytesIO()
+			with zipfile.ZipFile(
+				zip_buffer, "w", zipfile.ZIP_DEFLATED, compresslevel=6
+			) as zf:
+				# i know `dirs` isn't used, i just put it there for clarity
+				for root, dirs, files in os.walk(path):
+					if client_disconnected():
+						cancelled = True
+						break
+					for file in files:
+						if client_disconnected():
+							cancelled = True
+							break
+						
+						try:
+							full_path = os.path.join(root, file)
+							file_size = os.path.getsize(full_path)
+							rel_path = os.path.relpath(
+								full_path, os.path.dirname(path)
+								).replace("\\", "/")
+
+							zf.write(full_path, arcname=rel_path)
+							processed_bytes += file_size
+							file_count += 1
+
+							if file_count % 3 == 0:
+								send_progress()
+
+						except Exception:
+							continue
+					if cancelled:
+						break
+
+			if cancelled:
+				self.wfile.write(
+					b"data: {\"cancelled\": true, \"message\": "
+					b"\"Zipping cancelled by user\"}\n\n"
+				)
+			elif client_disconnected():
+				return	# client gone, no need to send more
+			else:
+				send_progress()
+				self.wfile.write(
+					f"data: {{\"complete\": true, \"size\": "
+					f"{len(zip_buffer.getvalue())}}}\n\n".encode("utf-8")
+				)
+			self.wfile.flush()
+		except GeneratorExit:
+			cancelled = True
+			self.wfile.write(
+				b'data: {"cancelled": true, "message": "Connection closed"}\n\n')
+			self.wfile.flush()
+		except Exception as e:
+			self.wfile.write(f'data: {{"error": true, "message": "{str(e)}"}}\n\n'.encode('utf-8'))
+			self.wfile.flush()
+
+
+	""" def translate_path(self, path):
+		path = super().translate_path(path)
+		if os.path.commonpath((self.SERVE_ROOT, path)) != self.SERVE_ROOT:
+			raise OSError("path outside serve root")
+		return path """
+
+
 	def list_directory(self, path):
+		"""Inject custom HTML to directory path."""
 		if not self.require_auth():
 			return None
 
@@ -217,7 +353,7 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 				<meta charset="utf-8">
 				<meta name="viewport" content="width=device-width, initial-scale=1.0">
 				<link rel="icon" type="image/x-icon" href="https://img.icons8.com/?size=100&id=kktvCbkDLbNb&format=png&color=000000">
-				<title>files on """ + SERVER_DIRECTORY_IP_AND_PORT.encode() + """</title>
+				<title>files on https://""" + SERVER_DIRECTORY_IP_AND_PORT.encode() + """</title>
 				<style>
 					body {
 						font-family: monospace;
@@ -259,73 +395,104 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 						const uploadBtn = document.getElementById("uploadBtn");
 						uploadBtn.disabled = fileInput.files.length === 0;
 						uploadBtn.textContent = fileInput.files.length > 0 ? 
-							`Upload ${fileInput.files.length} file(s)` : "Upload files";
-					}
-					let downloadStatus = null;
-					function showDownloadIndicator(filename) {
-						const container = document.getElementById('downloadStatus');
-						container.innerHTML = `⏳ Downloading "${filename}"...`;
-						container.style.display = 'block';
-						downloadStatus = setTimeout(() => {
-							container.style.display = 'none';
-						}, 25000); // Hide after 25s (adjust for your files)
+							`Upload ${fileInput.files.length} file(s)` :
+							"Upload files";
 					}
 
-					// Track ALL download clicks
+					let currentEventSource = null;
+					let currentAbortController = null;
+
+					function startDirDownload(dirLink) {
+						const dirName = dirLink.title?.replace("Download ", "")
+							|| dirLink.textContent.trim().replace("⬇️", "").trim();
+						const ssePath = dirLink.href.replace("?download=1", "")
+							+ "?sse=1";
+						const downloadPath = dirLink.href;
+						
+						const container = document.getElementById('download-status');
+						currentAbortController = new AbortController();
+						
+						container.innerHTML = `
+							<div style="display:flex;align-items:center;gap:10px;">
+								<span>⏳ Zipping "${dirName}"...</span>
+								<div style="flex:1;">
+									<div id="progress-bar" style="width:100%;height:20px;background:#e0e0e0;border-radius:10px;overflow:hidden;">
+										<div id="progress-fill" style="height:100%;background:#007cba;width:0%;transition:width 0.3s;"></div>
+									</div>
+									<div id="progress-text" style="font-size:11px;margin-top:4px;color:#666;">0%</div>
+								</div>
+								<button id="cancel-btn" style="padding:8px 12px;background:#dc3545;color:white;border:none;border-radius:4px;cursor:pointer;font-size:12px;">❌ Cancel</button>
+							</div>
+						`;
+						container.style.display = 'block';
+						
+						// Cancel button handler
+						document.getElementById('cancel-btn').onclick = function() {
+							if (currentEventSource) currentEventSource.close();
+							if (currentAbortController) currentAbortController.abort();
+							container.innerHTML = `❌ "${dirName}" zipping cancelled`;
+							setTimeout(() => container.style.display = 'none', 2000);
+						};
+						
+						if (currentEventSource) currentEventSource.close();
+						const eventSource = new EventSource(ssePath, { signal: currentAbortController.signal });
+						currentEventSource = eventSource;
+						
+						eventSource.onmessage = function(event) {
+							try {
+								const data = JSON.parse(event.data);
+								if (data.complete) {
+									container.innerHTML = `✅ "${dirName}.zip" ready (${formatBytes(data.size)})`;
+									document.getElementById('cancel-btn')?.remove();
+									setTimeout(() => {
+										window.location.href = downloadPath;
+										container.style.display = 'none';
+									}, 800);
+									eventSource.close();
+									return;
+								}
+								if (data.error || data.cancelled) {
+									container.innerHTML = `❌ ${data.message || 'Zipping cancelled'}`;
+									setTimeout(() => container.style.display = 'none', 3000);
+									eventSource.close();
+									return;
+								}
+								
+								const percent = Math.round(data.percent);
+								document.getElementById('progress-fill').style.width = percent + '%';
+								document.getElementById('progress-text').textContent = 
+									`${percent}% (${formatBytes(data.processed_bytes)} / ${formatBytes(data.total_size)})`;
+							} catch(e) {}
+						};
+						
+						eventSource.onerror = function() {
+							container.innerHTML = `❌ Connection failed for "${dirName}"`;
+							setTimeout(() => container.style.display = 'none', 3000);
+							eventSource.close();
+						};
+					}
+
+					function formatBytes(bytes) {
+						if (!bytes) return '0 B';
+						const k = 1024, sizes = ['B', 'KB', 'MB', 'GB'];
+						const i = Math.floor(Math.log(bytes) / Math.log(k));
+						return (bytes / Math.pow(k, i)).toFixed(1) + ' ' + sizes[i];
+					}
+
+					// Existing file download + directory tracking (unchanged)
 					document.addEventListener('click', function(e) {
 						const downloadLink = e.target.closest('a[href]');
-						if (downloadLink && (
-							downloadLink.getAttribute('download') || 
-							downloadLink.href.includes('?download=1') ||
-							downloadLink.textContent.includes('⬇️')
-						)) {
-							const filename = downloadLink.title?.replace('Download ', '') || 
-											downloadLink.textContent.trim().replace('⬇️', '').trim() || 'file';
-							showDownloadIndicator(filename);
+						if (downloadLink && downloadLink.href.includes('?download=1')) {
+							e.preventDefault();
+							startDirDownload(downloadLink);
+						} else if (downloadLink && (downloadLink.getAttribute('download') || downloadLink.textContent.includes('⬇️'))) {
+							const filename = downloadLink.title?.replace('Download ', '') || 'file';
+							const container = document.getElementById('download-status');
+							container.innerHTML = `⏳ Downloading "${filename}"...`;
+							container.style.display = 'block';
+							setTimeout(() => container.style.display = 'none', 25000);
 						}
 					}, true);
-
-					// this doesn't seem to work
-					function sortTable(n) {
-						let shouldSwitch = false;
-						let table = document.getElementById("fileTable");
-						let switching = true;
-						let dir = "asc";
-						while (switching) {
-							switching = false;
-							let rows = table.rows;
-							for (let i = 1; i < (rows.length - 1); i++) {
-								let shouldSwitch = false;
-								let x = rows[i].getElementsByTagName("td")[n];
-								let y = rows[i + 1].getElementsByTagName("td")[n];
-								console.log("retard");
-								if (
-									dir === "asc" && x.innerHTML.toLowerCase() >
-									y.innerHTML.toLowerCase()
-								) {
-									shouldSwitch = true;
-									break;
-								}
-									
-								if (dir === "desc" && x.innerHTML.toLowerCase()
-									< y.innerHTML.toLowerCase()
-								) {
-									shouldSwitch = true;
-									break;
-								}
-							}
-							if (shouldSwitch) {
-								rows[i].parentNode.insertBefore(rows[i+1], rows[i]);
-								switching = true;
-							} else {
-								if (dir === "asc")
-									dir = "desc";
-								else
-									dir = "asc";
-							}
-						}
-					}
-					// let activeDownloads = [];
 				</script>
 			</head>
 			<body>
@@ -358,7 +525,7 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 			)
 
 		f.write(b"""
-		<div id="downloadStatus" style="margin:20px 0;display:none;padding:12px;background:#e8f4fd;border:1px solid #007cba;border-radius:6px;font-weight:bold;"></div>
+		<div id="download-status" style="margin:20px 0;display:none;padding:12px;background:#e8f4fd;border:1px solid #007cba;border-radius:6px;font-weight:bold;"></div>
 		""")
 
 		directory_info = f"""
@@ -370,7 +537,7 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 			</ul>""".encode()
 
 		f.write(directory_info + b"""
-			<div><b>refresh the page if changes do not reflect across devices</b></div>
+			<div><i>refresh the page if changes do not reflect across devices</i></div>
 			<table id="fileTable">
 				<thead>
 					<tr>
@@ -400,10 +567,10 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 				f.write(f"""
 					<tr>
 						<td><div class="scrollable-cell">
-							<a href="{urllib.parse.quote(item)}/?download=1" style="text-decoration:none;" download title="Download {item} as ZIP">⬇️</a> 
-							📁 <a href="{urllib.parse.quote(item)}/">{item}/</a>
+							<a href="{urllib.parse.quote(item)}/?download=1" style="text-decoration:none;" download title="Download {item} as ZIP">⬇️</a>
+							📁 <a href="{urllib.parse.quote(item)}/"><b>{item}</b>/</a>
 						</div></td>
-						<td>folder</td>
+						<td>(folder)</td>
 						<td>{mod_date}</td>
 						<td>-</td>
 					</tr>""".encode()
@@ -467,14 +634,16 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 		if os.path.isdir(path):
 			# if URL doesn't end with "/", redirect to the slash-version (same behavior as SimpleHTTPRequestHandler)
 			if not self.path.endswith("/"):
-				new_path = self.path + "/"
 				self.send_response(301)
-				self.send_header("Location", new_path)
+				self.send_header("Location", f"{self.path}/")
 				self.end_headers()
 				return None
 
 			# force custom directory listing (never auto-serve index.html)
 			return self.list_directory(path)
+
+		if not os.path.isfile(path):
+			return None
 
 		# not a directory - serve file normally (mimic SimpleHTTPRequestHandler)
 		ctype = self.guess_type(path)
@@ -482,20 +651,18 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 			f = open(path, "rb")
 			fs = os.fstat(f.fileno())
 			filename = os.path.basename(urllib.parse.unquote(self.path))
-			total_size = fs.st_size # read more smth about this
 
 			self.send_response(200)
 			self.send_header("Content-Type", ctype)
-			self.send_header("Content-Encoding", "identity")
-			# i don't know if you really need the stray single and double quotes
+			# self.send_header("Content-Encoding", "identity")
 			self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{urllib.parse.quote(filename)}")
-			self.send_header("Content-Length", str(total_size))
-			self.send_header("X-File-Size", str(total_size))
-			self.send_header("Accept-Ranges", "bytes")
+			self.send_header("Content-Length", str(fs.st_size)) # read more smth about this
+			# self.send_header("X-File-Size", str(total_size))
+			# self.send_header("Accept-Ranges", "bytes")
 			self.send_header("Cache-Control", "no-cache")
 			self.send_header("Last-Modified", self.date_time_string(fs.st_mtime))
 			self.end_headers()
-			return (f, total_size) # for progress bar
+			return (f, fs.st_size) # for progress bar(?)
 		except OSError:
 			self.send_error(404, "File not found")
 			return None
@@ -657,8 +824,7 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 		self.send_header("Cache-Control", "no-cache")
 		self.end_headers()
 
-		# stream directly to the socket
-		with zipfile.ZipFile(self.wfile, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+		""" with zipfile.ZipFile(self.wfile, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
 			for root, dirs, files in os.walk(path):
 				for file in files:
 					try:
@@ -669,7 +835,24 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 						# fl;ush after each file to force data to browser
 						self.wfile.flush()
 					except Exception as e:
-						print(f"Failed to add {file} to ZIP: {e}")
+						print(f"Failed to add {file} to ZIP: {e}") """
+
+		# stream directly to the socket
+		zip_buffer = io.BytesIO()
+		try:
+			with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+				for root, dirs, files in os.walk(path):
+					for file in files:
+						try:
+							full_path = os.path.join(root, file)
+							rel_path = os.path.relpath(full_path, os.path.dirname(path)).replace("\\", "/")
+							zf.write(full_path, arcname=rel_path)
+						except Exception:
+							continue
+			zip_buffer.seek(0)
+			shutil.copyfileobj(zip_buffer, self.wfile)
+		finally:
+			zip_buffer.close()
 
 		self.wfile.flush()
 		return None
@@ -692,10 +875,20 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 		return True
 
 
-with socketserver.TCPServer((IPV4_ADDRESS, PORT), UploadHandler) as httpd:
-	print(f"\nGO TO http://{SERVER_DIRECTORY_IP_AND_PORT}")
-	httpd.serve_forever()
+if __name__ == "__main__":
+	if DIRECTORY and os.path.isdir(DIRECTORY):
+		os.chdir(DIRECTORY)
+		# store original serve directory for translate_path
+		UploadHandler.SERVE_ROOT = os.getcwd() if DIRECTORY and os.path.isdir(DIRECTORY) else os.getcwd()
+		print(f"Serving files from: {UploadHandler.SERVE_ROOT}")
 
+	httpd = socketserver.TCPServer((IPV4_ADDRESS, PORT), UploadHandler)
+
+	context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+	context.load_cert_chain(certfile=CERT_FILE, keyfile=CERT_KEY)
+	httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+	print(f"\nGo to https://{SERVER_DIRECTORY_IP_AND_PORT}, accept self-signed certificate warning in browser")
+	httpd.serve_forever()
 """
 command in dir containing this file:
 ```
