@@ -2,3 +2,4 @@
 secret.txt
 server.key
 server.crt
+shfs_compressed.py

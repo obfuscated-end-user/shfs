@@ -16,15 +16,15 @@ import base64
 import zipfile
 import shutil
 import socket
-import functools
 import json
 import ssl
 
 from dotenv import load_dotenv
 
-THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+import socket
 
 load_dotenv()
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 USERNAME = os.getenv("HTTP_USER")
 PASSWORD = os.getenv("HTTP_PASS")
 DEFAULT_CERT = os.path.join(THIS_DIR, "server.crt")
@@ -32,29 +32,31 @@ DEFAULT_KEY = os.path.join(THIS_DIR, "server.key")
 CERT_FILE = os.path.join(THIS_DIR, os.getenv("SSL_CERT", DEFAULT_CERT))
 CERT_KEY = os.path.join(THIS_DIR, os.getenv("SSL_KEY", DEFAULT_KEY))
 CREDENTIALS = base64.b64encode(f"{USERNAME}:{PASSWORD}".encode()).decode()
-
-IPV4_ADDRESS = os.getenv("IP_ADDR")
+try:
+	# returns your ip for some reason
+	with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+		s.connect(("8.8.8.8", 80))
+		IPV4_ADDRESS = s.getsockname()[0]
+except Exception:
+	IPV4_ADDRESS = "127.0.0.1"
 PORT = 9999 # baka baka
-# target folder for uploads
-# change this to whatever path you like, for example:
+
+# target folder for uploads, change this to whatever path you like, for example:
 # DIRECTORY = "C:\Users\User\Desktop\"
 # set it to "." to use current working directory instead (this folder)
-DIRECTORY = os.getenv("FOLDER")
-# DIRECTORY = "."
+DIRECTORY = os.getenv("FOLDER") # "."
 if DIRECTORY and os.path.isdir(DIRECTORY):
 	os.chdir(DIRECTORY)
 else:
-	print(f"Warning: DIRECTORY {DIRECTORY} is not set or does not exist. Using current working directory.")
+	print(f"Warning: DIRECTORY {DIRECTORY} is not set or does not exist. "
+			"Using current working directory."
+		)
 SERVER_DIRECTORY_IP_AND_PORT = f"{IPV4_ADDRESS}:{PORT}/"
 
 """
 to-do
 - visually remove this file in root (NOT DELETE) or make undeletable instead, idk
-- checkbox and zip for multi-download with the name of the directory
 - ui looks like crap on desktop
-- show the list of the files to be uploaded instead of being crammed like that
-- make each dir clickable on the root/path/path/... etc
-- how to automatically get valid ipv4 address from ipconfig
 
 done/implemented
 - add a password
@@ -64,13 +66,19 @@ done/implemented
 - show "nothing to see here" inside empty directories when opened
 - any file named exactly "index.html" can't be opened, unintended redirect loop
 - download a directory but compress it first
+- make each dir clickable on the root/path/path/... etc
+- can't download invdividual files directly using download button on microsoft edge
+- how to automatically get valid ipv4 address from ipconfig
+- show the list of the files to be uploaded instead of being crammed like that
+- how to make downloads faster
+- checkbox and zip for multi-download with the name of the directory
 """
 
-# change class name because that's not what it even does and i don't know why you stuck with that
-class UploadHandler(http.server.SimpleHTTPRequestHandler):
+class FileServerHandler(http.server.SimpleHTTPRequestHandler):
 	def __init__(self, *args, **kwargs):
 		super().__init__(*args, **kwargs)
 		self.wfile = self.wfile
+		self.request.settimeout(300)
 		try:
 			self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 		except Exception:
@@ -91,7 +99,7 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 		# get the actual directory path from request
 		dir_path = self.translate_path(urllib.parse.unquote(self.path))
 		if not dir_path or not os.path.isdir(dir_path):
-			dir_path = "."  # fallback to current working directory if invalid
+			dir_path = "."	# fallback to current working directory if invalid
 
 		form = cgi.FieldStorage(
 			fp=self.rfile,
@@ -99,20 +107,71 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 			environ={"REQUEST_METHOD":"POST"}
 		)
 
-		if "file" in form:
-			file_item = form["file"]
-			if file_item.filename and file_item.file:
-				filename = os.path.basename(file_item.filename.strip())
-				if filename:
-					filepath = os.path.join(dir_path, filename)
-					os.makedirs(os.path.dirname(filepath), exist_ok=True)
-					with open(filepath, "wb") as f:
-						f.write(file_item.file.read())
+		uploaded_count = 0
+		if "file" in form:	# if there are multiple files to be uploaded
+			file_items = form["file"]
+			if isinstance(file_items, list):
+				for file_item in file_items:
+					if file_item.filename and file_item.file:
+						filename = os.path.basename(file_item.filename.strip())
+						if filename:
+							filepath = os.path.join(dir_path, filename)
+							os.makedirs(os.path.dirname(filepath), exist_ok=True)
+							with open(filepath, "wb") as f:
+								shutil.copyfileobj(file_item.file, f)
+							uploaded_count += 1
+			else:	# else single file
+				if file_items.filename and file_items.file:
+					filename = os.path.basename(file_items.filename.strip())
+					if filename:
+						filepath = os.path.join(dir_path, filename)
+						os.makedirs(os.path.dirname(filepath), exist_ok=True)
+						with open(filepath, "wb") as f:
+							shutil.copyfileobj(file_items.file, f)
+						uploaded_count += 1
 
-					self.send_response(303)
-					self.send_header("Location", self.path)
-					self.end_headers()
-					return
+		if form.getvalue("multi_download"):
+			items = form.getlist("items[]")
+			if not items:
+				self.send_response(400)
+				self.end_headers()
+				return
+
+			zip_buffer = io.BytesIO()
+			try:
+				with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+					for item_encoded in items:
+						item_path = os.path.join(dir_path, urllib.parse.unquote(item_encoded))
+						if os.path.exists(item_path):
+							if os.path.isdir(item_path):
+								# add directory recursively
+								for root, _, files in os.walk(item_path):
+									for file in files:
+										full_path = os.path.join(root, file)
+										rel_path = os.path.relpath(full_path, dir_path).replace("\\", "/")
+										zf.write(full_path, arcname=rel_path)
+							else:
+								# add single file
+								rel_path = os.path.basename(item_path)
+								zf.write(item_path, arcname=rel_path)
+				current_folder = os.path.basename(os.path.normpath(dir_path)) or "selection"
+				zip_filename = f"{current_folder}.zip"
+				zip_buffer.seek(0)
+				self.send_response(200)
+				self.send_header("Content-Type", "application/zip")
+				self.send_header("Content-Disposition", f'attachment; filename="{zip_filename}"')
+				self.send_header("Content-Length", str(len(zip_buffer.getvalue())))
+				self.end_headers()
+				shutil.copyfileobj(zip_buffer, self.wfile)
+			finally:
+				zip_buffer.close()
+			return
+
+		if uploaded_count > 0:
+			self.send_response(303)
+			self.send_header("Location", self.path)
+			self.end_headers()
+			return
 
 		self.send_response(400)
 		self.end_headers()
@@ -123,28 +182,45 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 		if not self.require_auth():
 			return None
 
-		# normalize abnd decode path
+		# normalize and decode path
 		parsed = urllib.parse.urlsplit(self.path)
 		path_unquoted = urllib.parse.unquote(parsed.path)
 		query_params = urllib.parse.parse_qs(parsed.query)
-		# basename = os.path.basename(path_unquoted.rstrip("/")).lower()
 
-		#  check sse first before directory download
-		if query_params.get("sse") and os.path.isdir(self.translate_path(path_unquoted.rstrip("/"))):
-			self.do_SSE(path_unquoted.rstrip("/"))
-			return None
+		# check SSE first before directory download
+		if query_params.get("sse"):
+			target = self.translate_path(path_unquoted.rstrip("/"))
+			if os.path.isdir(target):
+				self.do_SSE(path_unquoted.rstrip("/"))
+				return None
+			else:
+				# SSE requested for a file or missing path, return a clear error
+				# send a small event-stream style error so EventSource receives 
+				# the correct mime
+				self.send_response(400)
+				self.send_header("Content-Type", "text/event-stream")
+				self.send_header("Cache-Control", "no-cache")
+				self.send_header("Connection", "close")
+				self.end_headers()
+				try:
+					# send a single SSE data block explaining failure
+					self.wfile.write(
+						b"data: {\"error\": true, \"message\": "
+						b"\"SSE only available for directories\"}\n\n"
+					)
+					self.wfile.flush()
+				except Exception:
+					pass
+				return None
 
 		# check for dir dl request
-		# clean_path = path_unquoted.rstrip("/")
-		if query_params.get("download") and os.path.isdir(self.translate_path(path_unquoted.rstrip("/"))):
+		if query_params.get("download") and \
+			os.path.isdir(self.translate_path(path_unquoted.rstrip("/"))):
 			return self.serve_directory_zip(path_unquoted.rstrip("/"))
 
-		# load index.html
-		""" if basename == "index.html" and os.path.isfile(self.translate_path(self.path)):
-			pass """
-
 		# only force plain-text for ACTUAL text documents
-		# "LICENSE" and "LICENCE" are for the license files commonly found in git repositories
+		# "LICENSE" and "LICENCE" are for the license files commonly found in
+		#  git repositories
 		text_ext = (
 			".txt", ".md", ".log", ".ini", ".cfg", ".conf", ".env", ".lrc",
 			"LICENSE", "LICENCE"
@@ -173,9 +249,13 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 			if isinstance(result, tuple):
 				f, total_size = result
 				try:
-					# shutil.copyfileobj(f, self.wfile)
 					# microsoft edge case (pun?)
-					self.connection.sendall(f.read())
+					CHUNK_SIZE = 65536  # 64KB chunks
+					while True:
+						chunk = f.read(CHUNK_SIZE)
+						if not chunk: break
+						self.wfile.write(chunk)
+						self.wfile.flush()
 					self.wfile.flush()
 				finally:
 					f.close()
@@ -248,6 +328,7 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 		# check if client dced
 		def client_disconnected():
 			try:
+				# do i need to do this?
 				self.wfile.write(b"")
 				self.wfile.flush()
 				return False
@@ -255,14 +336,14 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 				return True
 
 		send_progress()	# initial
-		
+
 		try:
 			zip_buffer = io.BytesIO()
 			with zipfile.ZipFile(
 				zip_buffer, "w", zipfile.ZIP_DEFLATED, compresslevel=6
 			) as zf:
 				# i know `dirs` isn't used, i just put it there for clarity
-				for root, dirs, files in os.walk(path):
+				for root, _, files in os.walk(path):
 					if client_disconnected():
 						cancelled = True
 						break
@@ -270,7 +351,7 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 						if client_disconnected():
 							cancelled = True
 							break
-						
+
 						try:
 							full_path = os.path.join(root, file)
 							file_size = os.path.getsize(full_path)
@@ -310,15 +391,32 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 				b'data: {"cancelled": true, "message": "Connection closed"}\n\n')
 			self.wfile.flush()
 		except Exception as e:
-			self.wfile.write(f'data: {{"error": true, "message": "{str(e)}"}}\n\n'.encode('utf-8'))
+			self.wfile.write(f'data: {{"error": true, "message": "{str(e)}"}}\n\n'.encode("utf-8"))
 			self.wfile.flush()
 
 
-	""" def translate_path(self, path):
-		path = super().translate_path(path)
-		if os.path.commonpath((self.SERVE_ROOT, path)) != self.SERVE_ROOT:
-			raise OSError("path outside serve root")
-		return path """
+	# https://en.wikipedia.org/wiki/Breadcrumb_navigation
+	# /root/path1/path2/path3/... where all the paths are clickable
+	def generate_breadcrumbs(self, path):
+		"""Generate breadcrumb HTML from current path."""
+		parts = [p for p in path.strip("/").split("/") if p]
+		breadcrumbs = []
+		# root link (always present)
+		breadcrumbs.append('<a href="/" class="breadcrumb-link">root</a>')
+		# Build clickable path segments
+		current_path = ""
+		for i, part in enumerate(parts):
+			display_name = urllib.parse.unquote(part)
+			# encoded_part = urllib.parse.quote(part)
+			current_path += f"/{part}"
+			current_path_segments = parts[:i+1]
+			# full path up to this segment
+			full_http_path = "/" + "/".join(current_path_segments) + "/"
+			breadcrumbs.append(
+				f'<a href="{full_http_path}" class="breadcrumb-link">{display_name}</a>'
+			)
+
+		return "/".join(breadcrumbs)
 
 
 	def list_directory(self, path):
@@ -327,15 +425,20 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 			return None
 
 		f = io.BytesIO()
-		displaypath = html.escape(urllib.parse.unquote(self.path))
 
 		try:
 			listdir = os.listdir(path)
 
-			num_files = sum(1 for item in listdir if os.path.isfile(os.path.join(path, item)))
-			num_dirs = sum(1 for item in listdir if os.path.isdir(os.path.join(path, item)))
+			num_files = sum(
+				1 for item in listdir
+				if os.path.isfile(os.path.join(path, item)))
+			num_dirs = sum(
+				1 for item in listdir
+				if os.path.isdir(os.path.join(path, item)))
 			total_items = len(listdir)
-			total_size_bytes = sum(os.path.getsize(os.path.join(path, item)) for item in listdir if os.path.isfile(os.path.join(path, item)))
+			total_size_bytes = sum(
+				os.path.getsize(os.path.join(path, item))
+				for item in listdir if os.path.isfile(os.path.join(path, item)))
 		except OSError:
 			self.send_error(404, "No permission to list directory")
 			return None
@@ -368,9 +471,19 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 						width: 50%;
 						margin: 10px 0;
 					}
-					#fileTable {
+					#up-one-level {
+						display: inline-block;
+						padding: 10px 15px;
+						background: #ddd;
+						margin-right: 10px;
+						text-decoration: none;
+						border-radius: 4px;
+					}
+					#file-table {
+						margin-top: 5px;
 						width: 100%;
 						border-collapse: collapse;
+						table-layout: auto;
 					}
 					th {
 						padding: 10px;
@@ -379,24 +492,152 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 						background:#f0f0f0;
 					}
 					td {
-						border:1px solid black;
-						padding:8px;
-						vertical-align: top;
+						border: 1px solid black;
+						padding: 5px; 
+					}
+					td:nth-child(4) {
+						text-align: right;
 					}
 					.scrollable-cell {
-						max-width: 250px;
+						max-width: 300px;
 						overflow-x: auto;
 						white-space: nowrap;
 					}
+					#progress-container {
+						display: flex;
+						align-items: center;
+						gap: 10px;
+					}
+					#progress-bar {
+						width: 100%;
+						height: 20px;
+						background: #e0e0e0;
+						border-radius: 10px;
+						overflow: hidden;
+					}
+					#progress-fill {
+						height: 100%;
+						background: #007cba;
+						width: 0%;
+						transition: width 0.3s;
+					}
+					#progress-text {
+						font-size: 11px;
+						margin-top: 4px;
+						color: #666;
+					}
+					#cancel-btn {
+						padding: 8px 12px;
+						background: #dc3545;
+						color: #fff;
+						border: none;
+						border-radius: 4px;
+						cursor: pointer;
+						font-size: 12px;
+					}
+					#download-status {
+						margin: 20px 0;
+						display: none;
+						padding: 12px;
+						background: #e8f4fd;
+						border: 1px solid #007cba;
+						border-radius: 6px;
+						font-weight: bold;
+					}
+					#empty-directory {
+						text-align: center;
+						padding: 40px;
+						font-style: italic;
+						color: #666;
+					}
+					.directory-item, .breadcrumb-link {
+						text-decoration: none;
+					}
+					#file-list {
+						max-height: 200px;
+						overflow-y: auto;
+						scrollbar-width: thin;
+					}
+					#file-list::-webkit-scrollbar {
+						width: 8px;
+					}
+					#file-list::-webkit-scrollbar-track {
+						background: #f1f1f1;
+					}
+					#file-list::-webkit-scrollbar-thumb {
+						background: #c1c1c1;
+						border-radius: 4px;
+					}
 				</style>
 				<script>
+					// make this crap easier to read
 					function toggleUpload() {
-						const fileInput = document.getElementById("fileInput");
-						const uploadBtn = document.getElementById("uploadBtn");
-						uploadBtn.disabled = fileInput.files.length === 0;
-						uploadBtn.textContent = fileInput.files.length > 0 ? 
-							`Upload ${fileInput.files.length} file(s)` :
-							"Upload files";
+						const fileInput = document.getElementById("file-input");
+						const uploadBtn = document.getElementById("upload-btn");
+						const fileListContainer = document.getElementById("file-list");
+
+						if (!fileListContainer) {
+							const container = document.createElement("div");
+							container.id = "file-list";
+							container.style.cssText = `
+								max-height:200px;overflow-y:auto;border:1px solid #ddd;
+								border-radius:4px;padding:10px;margin:10px 0;
+								background:#f9f9f9;font-size:12px;max-width:50%;`;
+							fileInput.parentNode.insertBefore(container, uploadBtn);
+						}
+
+						// use DataTransfer to manage files (allows removal/replacement)
+						if (!window.selectedFilesDT) window.selectedFilesDT = new DataTransfer();
+						const dt = window.selectedFilesDT;
+						if (fileInput.files.length > 0) {
+							// add new files, skipping dupes by name
+							Array.from(fileInput.files).forEach(file => {
+								const exists = Array.from(dt.files).some(f => f.name === file.name && f.size === file.size);
+								if (!exists) dt.items.add(file);
+							});
+							fileInput.files = dt.files;	// update input to reflect current files
+						}
+						fileListContainer.innerHTML = "";
+						if (dt.files.length === 0) {
+							fileListContainer.innerHTML = `<em style="color:#999;">no files selected</em>`;
+							uploadBtn.disabled = true;
+							return;
+						}
+						let totalSize = 0;
+						Array.from(dt.files).forEach((file, index) => {
+							const fileItem = document.createElement("div");
+							fileItem.style.marginBottom = "5px";
+							fileItem.style.position = "relative";
+							totalSize += file.size;
+							fileItem.innerHTML = `
+								<span style="color:#666;font-size:11px;">${index+1}.</span> 
+								${file.name} <span style="color:#666;font-size:11px;">(${formatBytes(file.size)})</span>
+								<button class="remove-file" data-index="${index}" style="
+									position:absolute;right:5px;top:0;padding:2px 6px;
+									background:#dc3545;color:white;border:none;border-radius:3px;
+									font-size:10px;cursor:pointer;font-weight:bold;
+								">✕</button>`;
+							fileListContainer.appendChild(fileItem);
+						});
+						fileListContainer.innerHTML += `<div style="font-weight:bold;margin-top:5px;color:#007cba;">
+							total: ${dt.files.length} file(s), ${formatBytes(totalSize)}
+						</div>`;
+						// bind remove handlers
+						fileListContainer.querySelectorAll(".remove-file").forEach(btn => {
+							btn.onclick = function(e) {
+								e.stopPropagation();
+								const idx = parseInt(this.dataset.index);
+								const newDT = new DataTransfer();
+								Array.from(dt.files).forEach((f, i) => {
+									if (i !== idx) newDT.items.add(f);
+								});
+								window.selectedFilesDT = newDT;
+								fileInput.files = newDT.files;
+								toggleUpload();  // refresh list
+							};
+						});
+						uploadBtn.disabled = false;
+						uploadBtn.textContent = `upload ${dt.files.length} file(s)`;
 					}
 
 					let currentEventSource = null;
@@ -408,101 +649,223 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 						const ssePath = dirLink.href.replace("?download=1", "")
 							+ "?sse=1";
 						const downloadPath = dirLink.href;
-						
-						const container = document.getElementById('download-status');
+						const container = document.getElementById("download-status");
 						currentAbortController = new AbortController();
-						
 						container.innerHTML = `
-							<div style="display:flex;align-items:center;gap:10px;">
-								<span>⏳ Zipping "${dirName}"...</span>
+							<div id="progress-container">
+								<span>⏳ zipping "${dirName}"...</span>
 								<div style="flex:1;">
-									<div id="progress-bar" style="width:100%;height:20px;background:#e0e0e0;border-radius:10px;overflow:hidden;">
-										<div id="progress-fill" style="height:100%;background:#007cba;width:0%;transition:width 0.3s;"></div>
+									<div id="progress-bar">
+										<div id="progress-fill"></div>
 									</div>
-									<div id="progress-text" style="font-size:11px;margin-top:4px;color:#666;">0%</div>
+									<div id="progress-text">0%</div>
 								</div>
-								<button id="cancel-btn" style="padding:8px 12px;background:#dc3545;color:white;border:none;border-radius:4px;cursor:pointer;font-size:12px;">❌ Cancel</button>
+								<button id="cancel-btn">❌ cancel</button>
 							</div>
 						`;
-						container.style.display = 'block';
-						
-						// Cancel button handler
-						document.getElementById('cancel-btn').onclick = function() {
+						container.style.display = "block";
+						// cancel button handler
+						document.getElementById("cancel-btn").onclick = function() {
 							if (currentEventSource) currentEventSource.close();
 							if (currentAbortController) currentAbortController.abort();
 							container.innerHTML = `❌ "${dirName}" zipping cancelled`;
-							setTimeout(() => container.style.display = 'none', 2000);
+							setTimeout(() => container.style.display = "none", 2000);
 						};
-						
+
 						if (currentEventSource) currentEventSource.close();
-						const eventSource = new EventSource(ssePath, { signal: currentAbortController.signal });
+						const eventSource = new EventSource(
+							ssePath,
+							{ signal: currentAbortController.signal }
+						);
 						currentEventSource = eventSource;
-						
+
 						eventSource.onmessage = function(event) {
 							try {
 								const data = JSON.parse(event.data);
 								if (data.complete) {
 									container.innerHTML = `✅ "${dirName}.zip" ready (${formatBytes(data.size)})`;
-									document.getElementById('cancel-btn')?.remove();
+									document.getElementById("cancel-btn")?.remove();
 									setTimeout(() => {
 										window.location.href = downloadPath;
-										container.style.display = 'none';
+										container.style.display = "none";
 									}, 800);
 									eventSource.close();
 									return;
 								}
 								if (data.error || data.cancelled) {
-									container.innerHTML = `❌ ${data.message || 'Zipping cancelled'}`;
-									setTimeout(() => container.style.display = 'none', 3000);
+									container.innerHTML = `${data.message || "zipping cancelled"}`;
+									setTimeout(() => container.style.display = "none", 3000);
 									eventSource.close();
 									return;
 								}
-								
+
 								const percent = Math.round(data.percent);
-								document.getElementById('progress-fill').style.width = percent + '%';
-								document.getElementById('progress-text').textContent = 
+								document.getElementById("progress-fill").style.width = percent + "%";
+								document.getElementById("progress-text").textContent = 
 									`${percent}% (${formatBytes(data.processed_bytes)} / ${formatBytes(data.total_size)})`;
 							} catch(e) {}
 						};
-						
 						eventSource.onerror = function() {
-							container.innerHTML = `❌ Connection failed for "${dirName}"`;
-							setTimeout(() => container.style.display = 'none', 3000);
+							container.innerHTML = `connection failed for "${dirName}"`;
+							setTimeout(() => container.style.display = "none", 3000);
 							eventSource.close();
 						};
 					}
 
+					// this is for the zipping folder decal
 					function formatBytes(bytes) {
-						if (!bytes) return '0 B';
-						const k = 1024, sizes = ['B', 'KB', 'MB', 'GB'];
+						if (!bytes) return "0 B";
+						const k = 1024, sizes = ["B", "KB", "MB", "GB"];
 						const i = Math.floor(Math.log(bytes) / Math.log(k));
-						return (bytes / Math.pow(k, i)).toFixed(1) + ' ' + sizes[i];
+						return (bytes / Math.pow(k, i)).toFixed(1) + " " + sizes[i];
 					}
 
-					// Existing file download + directory tracking (unchanged)
-					document.addEventListener('click', function(e) {
-						const downloadLink = e.target.closest('a[href]');
-						if (downloadLink && downloadLink.href.includes('?download=1')) {
-							e.preventDefault();
-							startDirDownload(downloadLink);
-						} else if (downloadLink && (downloadLink.getAttribute('download') || downloadLink.textContent.includes('⬇️'))) {
-							const filename = downloadLink.title?.replace('Download ', '') || 'file';
-							const container = document.getElementById('download-status');
-							container.innerHTML = `⏳ Downloading "${filename}"...`;
+					document.addEventListener("click", function(e) {
+						const downloadLink = e.target.closest("a[href]");
+						if (
+							downloadLink &&
+							downloadLink.href.includes("?download=1")
+						) {
+							// only treat as a directory zipping operation if
+							// the path ends with a slash
+							const url = new URL(downloadLink.href);
+							if (url.pathname.endsWith("/")) {
+								e.preventDefault();
+								startDirDownload(downloadLink);
+							}
+						} else if (
+							downloadLink &&
+							(downloadLink.getAttribute("download") ||
+							downloadLink.textContent.includes("⬇️"))
+						) {
+							const filename = downloadLink.title?.replace("Download ", "") || "file";
+							const container = document.getElementById("download-status");
+							container.innerHTML = `⏳ downloading "${filename}"...`;
 							container.style.display = 'block';
 							setTimeout(() => container.style.display = 'none', 25000);
 						}
 					}, true);
+
+					function detectDevice() {
+						const ua = navigator.userAgent;
+						const platform = navigator.platform;
+						const language = navigator.language;
+						const screenRes = `${screen.width}x${screen.height}`;
+						// chrome-only thing
+						const deviceMemory = navigator.deviceMemory || "-1";
+						const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(ua);
+						const isTablet = /iPad|Android(?!.*Mobile)|Tablet/i.test(ua);
+
+						const deviceType = isMobile ? "Mobile" : (isTablet ? "Tablet" : "Desktop");
+
+						const browser = ua.includes("Chrome") ? "Chrome" :
+									ua.includes("Firefox") ? "Firefox" :
+									ua.includes("Safari") ? "Safari" :
+									ua.includes("Edge") ? "Edge" : "Other";
+						
+						const info = document.createElement("div");
+						info.id = "client-info";
+						info.style.cssText = `
+							background:#e8f4fd;padding:12px;border:1px solid #007cba;
+							border-radius:6px;margin:10px 0;font-size:13px;
+							font-family:monospace;
+						`;
+						info.innerHTML = `
+							<strong>${deviceType}</strong> | 
+							${browser} on ${platform} | 
+							${screenRes} | 
+							${language} | 
+							RAM: ${deviceMemory}GB
+						`;
+						const serverInfo = document.querySelector('div[style*="background:#f0f8ff"]');
+						if (serverInfo)
+							serverInfo.parentNode.insertBefore(info, serverInfo.nextSibling);
+						else
+							document.body.insertBefore(info, document.body.firstChild);
+					}
+
+					// run on page load
+					if (document.readyState === "loading")
+						document.addEventListener("DOMContentLoaded", detectDevice);
+					else
+						detectDevice();
+
+					let selectedItems = new Set();
+
+					function toggleAll(checkbox) {
+						document.querySelectorAll('.file-select').forEach(cb => {
+							cb.checked = checkbox.checked;
+						});
+						updateSelection();
+					}
+
+					function updateSelection() {
+						selectedItems.clear();
+						document.querySelectorAll('.file-select:checked').forEach(cb => {
+							selectedItems.add(cb.value);
+						});
+						const count = selectedItems.size;
+						const btn = document.getElementById('multi-download');
+						btn.disabled = count === 0;
+						btn.textContent = `⬇️ download selected (${count})`;
+					}
+
+					// Add to existing document.addEventListener("click"...)
+					document.addEventListener("change", function(e) {
+						if (e.target.classList.contains('file-select')) {
+							updateSelection();
+						}
+					});
+
+					// multi-download function
+					function downloadSelected() {
+						if (selectedItems.size === 0) return;
+
+						const form = document.createElement("form");
+						form.method = "POST";
+						form.style.display = "none";
+						form.enctype = "multipart/form-data";
+
+						const multiDownloadInput = document.createElement("input");
+						multiDownloadInput.type = "hidden";
+						multiDownloadInput.name = "multi_download";
+						multiDownloadInput.value = "1";
+						form.appendChild(multiDownloadInput);
+
+						selectedItems.forEach(item => {
+							const itemInput = document.createElement("input");
+							itemInput.type = "hidden";
+							itemInput.name = "items[]";
+							itemInput.value = item;
+							form.appendChild(itemInput);
+						});
+
+						const container = document.getElementById("download-status");
+						container.innerHTML = `zipping ${selectedItems.size} items...`;
+						container.style.display = "block";
+
+						// submit form, browser handles download natively
+						document.body.appendChild(form);
+						form.submit();
+						document.body.removeChild(form);
+
+						// update status after delay
+						setTimeout(() => {
+							container.innerHTML = "zipping complete";
+							setTimeout(() => container.style.display = "none", 3000);
+						}, 1000);
+					}
 				</script>
 			</head>
 			<body>
 				<form method="post" enctype="multipart/form-data" action=".">
-					<input type="file" id="fileInput" name="file" multiple onchange="toggleUpload()">
-					<input type="submit" id="uploadBtn" value="Upload files" disabled>
+					<input type="file" id="file-input" name="file" multiple onchange="toggleUpload()">
+					<div id="file-list"></div>
+					<input type="submit" id="upload-btn" value="Upload files" disabled style="width: 50%;">
 				</form>
 		""".encode("utf-8"))
 
-		f.write(f"<h3>📁 root{displaypath}</h3>".encode())
+		f.write(f"<h3>📁 {self.generate_breadcrumbs(self.path)}</h3>".encode())
 
 		if self.path == "/" or self.path.strip("/") == "":
 			pass
@@ -518,15 +881,15 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 				parent_http = "/"
 
 			f.write(f"""
-				<div style="margin-bottom: 20px;">
-					<a href="{parent_http}" style="display:inline-block;padding:10px 15px;background:#ddd;margin-right:10px;text-decoration:none;border-radius:4px;">up one level</a>
-					<a href="/" style="display:inline-block;padding:10px 15px;background:#007cba;color:white;text-decoration:none;border-radius:4px;">go to root</a>
-				</div>""".encode("utf-8")
-			)
+				<div>
+					<a href="{parent_http}" id="up-one-level" title="up one level">⬆️</a>
+					<button id="multi-download" disabled style="
+						padding:12px 20px; background:#007cba; color:white; border:none;
+						border-radius:6px; cursor:pointer; font-size:14px; font-weight:bold;
+					" onclick="downloadSelected()">⬇️ download selected (0)</button>
+				</div>""".encode("utf-8"))
 
-		f.write(b"""
-		<div id="download-status" style="margin:20px 0;display:none;padding:12px;background:#e8f4fd;border:1px solid #007cba;border-radius:6px;font-weight:bold;"></div>
-		""")
+		f.write(b"""<div id="download-status"></div>""")
 
 		directory_info = f"""
 			<ul>
@@ -537,38 +900,41 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 			</ul>""".encode()
 
 		f.write(directory_info + b"""
-			<div><i>refresh the page if changes do not reflect across devices</i></div>
-			<table id="fileTable">
+			<div><i>(refresh the page if changes do not reflect across devices)</i></div>
+			<table id="file-table">
 				<thead>
 					<tr>
-						<th onclick="sortTable(0)">Name</th>
-						<th onclick="sortTable(1)">Type</th>
-						<th onclick="sortTable(2)">Modified</th>
-						<th onclick="sortTable(3)">Size</th>
+						<th style="width:20px;"><input type="checkbox" id="select-all" onchange="toggleAll(this)"></th>	
+						<th>Name</th>
+						<th>Type</th>
+						<th>Modified</th>
+						<th>Size</th>
 					</tr>
 				</thead>
-				<tbody>"""
-		)
+				<tbody>""")
 
 		if total_items == 0:
 			f.write(b"""
 				<tr>
-					<td colspan="4" style="text-align:center;padding:40px;font-style:italic;color:#666;">nothing to see here</td>
-				</tr>"""
-			)
-
+					<td id="empty-directory" colspan="4">nothing to see here</td>
+				</tr>""")
 
 		for item in listdir:
 			fullname = os.path.join(path, item)
 			mod_time = os.path.getmtime(fullname)
-			mod_date = time.strftime('%Y-%m-%d %H:%M', time.localtime(mod_time))
+			mod_date = time.strftime("%Y-%m-%d %H:%M", time.localtime(mod_time))
 
 			if os.path.isdir(fullname):
 				f.write(f"""
 					<tr>
+						<td style="width:20px;text-align:center;">
+							<input type="checkbox" class="file-select" value="{urllib.parse.quote(item)}" 
+								data-type="{ 'dir' if os.path.isdir(fullname) else 'file' }"
+								data-path="{urllib.parse.quote(fullname)}">
+						</td>
 						<td><div class="scrollable-cell">
-							<a href="{urllib.parse.quote(item)}/?download=1" style="text-decoration:none;" download title="Download {item} as ZIP">⬇️</a>
-							📁 <a href="{urllib.parse.quote(item)}/"><b>{item}</b>/</a>
+							<a href="{urllib.parse.quote(item)}/?download=1" class="directory-item" download title="Download {item} as ZIP">⬇️</a>
+							📁 <a href="{urllib.parse.quote(item)}/" class="directory-item"><b>{item}</b>/</a>
 						</div></td>
 						<td>(folder)</td>
 						<td>{mod_date}</td>
@@ -580,15 +946,24 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 				size = self.format_size(os.path.getsize(fullname))
 				encoded = urllib.parse.quote(item)
 				filetype = self.detect_filetype(item)
+				# for some reason on edge, adding a "download" attribute on the
+				# anchor below prevents it from downloading
+				# you can download the file manually by right clicking and
+				# saving it as a file, but that's stupid
 				f.write(f"""
 					<tr>
+						<td style="width:20px;text-align:center;">
+							<input type="checkbox" class="file-select" value="{urllib.parse.quote(item)}" 
+								data-type="{ 'dir' if os.path.isdir(fullname) else 'file' }"
+								data-path="{urllib.parse.quote(fullname)}">
+						</td>
 						<td><div class="scrollable-cell">
-							<a href="{encoded}" style="text-decoration:none;" download title="Download {item}">⬇️</a> {emoji} 
-							<a href="{urllib.parse.quote(item)}">{item}</a>
+							<a href="{encoded}?download=1/" class="directory-item" title="Download {item}">⬇️</a> {emoji} 
+							<a href="{encoded}" class="directory-item">{item}</a>
 						</div></td>
 						<td>{filetype}</td>
 						<td>{mod_date}</td>
-						<td>{size}</td>
+						<td title="{os.path.getsize(fullname):,} bytes">{size}</td>
 					</tr>""".encode()
 				)
 
@@ -603,23 +978,6 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 
 		return f
 
-		# UNREACHABLE STATEMENT
-		try:
-			fs = os.fstat(f.fileno())
-			self.send_response(200)
-			self.send_header("Content-type", ctype)
-			self.send_header("Content-Length", str(fs[6]))
-			# Last-Modified header
-			self.send_header(
-				"Last-Modified",
-				self.date_time_string(fs.st_mtime)
-			)
-			self.end_headers()
-			return f
-		except:
-			f.close()
-			raise
-
 
 	def send_head(self):
 		"""Serve a file or force directory listing even if index.html exists."""
@@ -627,53 +985,71 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 		if not self.require_auth():
 			return None
 
-		# translate URL path to local filesystem path
+		# translate url path to local filesystem path
 		path = self.translate_path(self.path)
 
 		#if path is a directory
 		if os.path.isdir(path):
-			# if URL doesn't end with "/", redirect to the slash-version (same behavior as SimpleHTTPRequestHandler)
+			# if url doesn't end with "/", redirect to the slash-version
+			# (same behavior as SimpleHTTPRequestHandler)
 			if not self.path.endswith("/"):
 				self.send_response(301)
 				self.send_header("Location", f"{self.path}/")
 				self.end_headers()
 				return None
-
 			# force custom directory listing (never auto-serve index.html)
 			return self.list_directory(path)
 
 		if not os.path.isfile(path):
+			self.send_error(404, "File not found")
 			return None
 
-		# not a directory - serve file normally (mimic SimpleHTTPRequestHandler)
+		# not a directory, serve file normally (mimic SimpleHTTPRequestHandler)
 		ctype = self.guess_type(path)
 		try:
 			f = open(path, "rb")
-			fs = os.fstat(f.fileno())
-			filename = os.path.basename(urllib.parse.unquote(self.path))
-
-			self.send_response(200)
-			self.send_header("Content-Type", ctype)
-			# self.send_header("Content-Encoding", "identity")
-			self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{urllib.parse.quote(filename)}")
-			self.send_header("Content-Length", str(fs.st_size)) # read more smth about this
-			# self.send_header("X-File-Size", str(total_size))
-			# self.send_header("Accept-Ranges", "bytes")
-			self.send_header("Cache-Control", "no-cache")
-			self.send_header("Last-Modified", self.date_time_string(fs.st_mtime))
-			self.end_headers()
-			return (f, fs.st_size) # for progress bar(?)
 		except OSError:
 			self.send_error(404, "File not found")
 			return None
+		
+		fs = os.fstat(f.fileno())
+		# there was a weird edge case here that it downloaded .7z files as .tgz
+		parsed_path = urllib.parse.urlparse(self.path).path
+		filename = os.path.basename(urllib.parse.unquote(parsed_path))
+
+		parsed = urllib.parse.urlparse(self.path)
+		params = urllib.parse.parse_qs(parsed.query)
+		is_download = "download" in params
+
+		self.send_response(200)
+		self.send_header("Content-Type", ctype)
+		self.send_header("Content-Length", str(fs.st_size)) # read more smth about this
+		self.send_header("Last-Modified", self.date_time_string(fs.st_mtime))
+		self.send_header("Cache-Control", "no-cache")
+		# IMPORTANT DO NOT REMOVE
+		if is_download:
+			self.send_header(
+				"Content-Disposition",
+				f"attachment; filename=\"{filename}\""
+			)
+		else:
+			self.send_header(
+				"Content-Disposition",
+				f"inline; filename*=UTF-8''{urllib.parse.quote(filename)}"
+			)
+		self.end_headers()
+		return (f, fs.st_size) # for progress bar(?)
 
 
 	def format_size(self, size_bytes):
 		if size_bytes == 0:
 			return "0 B"
-		for unit in ["B", "KB", "MB", "GB", "TB"]:
+		elif size_bytes < 1024.0:
+			return f"{size_bytes} B"
+		# first unit doesn't matter
+		for unit in ["", "KB", "MB", "GB", "TB"]:
 			if size_bytes < 1024.0:
-				return f"{size_bytes:.1f} {unit}"
+				return f"{size_bytes:.2f} {unit}"
 			size_bytes /= 1024.0
 		return f"{size_bytes:.1f} PB"
 
@@ -681,8 +1057,10 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 	def get_file_emoji(self, filename):
 		ext = os.path.splitext(filename)[1].lower()
 
-		# you have to be aware that sometimes, two completely different file types can have the same extension
-		# for example, both mpeg transport streams and typescript files use the ".ts" extension
+		# you have to be aware that sometimes, two completely different file
+		# types can have the same extension
+		# for example, both mpeg transport streams and typescript files use the
+		# ".ts" extension
 		mapping = {
 			"image": {
 				".png", ".jpg", ".jpeg", ".gif",
@@ -767,7 +1145,7 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 				return emoji_map[category]
 
 		return "📄"
-	
+
 
 	def detect_filetype(self, name):
 		# pure dotfiles like ".env", ".gitignore", ".bashrc"
@@ -780,7 +1158,8 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 			return ext[1:].lower()
 
 		# no-extension known file types
-		# for example, (most) license files in github are just "LICENSE" and not "LICENSE.txt" or ".license", etc.
+		# for example, (most) license files in github are just "LICENSE" and not
+		# "LICENSE.txt" or ".license", etc.
 		specials = {
 			"LICENSE": "license",
 			"LICENCE": "license",	# 🇬🇧
@@ -824,28 +1203,19 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 		self.send_header("Cache-Control", "no-cache")
 		self.end_headers()
 
-		""" with zipfile.ZipFile(self.wfile, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
-			for root, dirs, files in os.walk(path):
-				for file in files:
-					try:
-						full_path = os.path.join(root, file)
-						rel_path = os.path.relpath(full_path, os.path.dirname(path))
-						rel_path = rel_path.replace("\\", "/")  # cross-platform
-						zf.write(full_path, arcname=rel_path)
-						# fl;ush after each file to force data to browser
-						self.wfile.flush()
-					except Exception as e:
-						print(f"Failed to add {file} to ZIP: {e}") """
-
 		# stream directly to the socket
 		zip_buffer = io.BytesIO()
 		try:
-			with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
-				for root, dirs, files in os.walk(path):
+			with zipfile.ZipFile(
+				zip_buffer, "w", zipfile.ZIP_DEFLATED, compresslevel=6
+			) as zf:
+				for root, _, files in os.walk(path):
 					for file in files:
 						try:
 							full_path = os.path.join(root, file)
-							rel_path = os.path.relpath(full_path, os.path.dirname(path)).replace("\\", "/")
+							rel_path = os.path.relpath(
+								full_path, os.path.dirname(path)
+							).replace("\\", "/")
 							zf.write(full_path, arcname=rel_path)
 						except Exception:
 							continue
@@ -879,22 +1249,19 @@ if __name__ == "__main__":
 	if DIRECTORY and os.path.isdir(DIRECTORY):
 		os.chdir(DIRECTORY)
 		# store original serve directory for translate_path
-		UploadHandler.SERVE_ROOT = os.getcwd() if DIRECTORY and os.path.isdir(DIRECTORY) else os.getcwd()
-		print(f"Serving files from: {UploadHandler.SERVE_ROOT}")
+		FileServerHandler.SERVE_ROOT = os.getcwd() \
+			if DIRECTORY and os.path.isdir(DIRECTORY) else os.getcwd()
+		print(f"Serving files from: {FileServerHandler.SERVE_ROOT}")
 
-	httpd = socketserver.TCPServer((IPV4_ADDRESS, PORT), UploadHandler)
-
+	httpd = socketserver.ThreadingTCPServer((IPV4_ADDRESS, PORT), FileServerHandler)
+	httpd.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+	httpd.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1048576)	# 1MB
+	httpd.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1048576)
 	context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 	context.load_cert_chain(certfile=CERT_FILE, keyfile=CERT_KEY)
 	httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
-	print(f"\nGo to https://{SERVER_DIRECTORY_IP_AND_PORT}, accept self-signed certificate warning in browser")
+	print(
+		f"\nGo to https://{SERVER_DIRECTORY_IP_AND_PORT}, "
+		"accept self-signed certificate warning in browser"
+	)
 	httpd.serve_forever()
-"""
-command in dir containing this file:
-```
-python -m http.server 9999 --cgi -b 192.168.1.22 (DON'T USE THIS)
-python upload.py
-```
-Q: What the hell is this?
-A: A HTTP file sharing thing written in python.
-"""
