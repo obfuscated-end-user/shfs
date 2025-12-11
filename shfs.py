@@ -10,7 +10,6 @@ import cgi
 import os
 import time
 import urllib
-import html
 import io
 import base64
 import zipfile
@@ -59,7 +58,7 @@ SERVER_DIRECTORY_IP_AND_PORT = f"{IPV4_ADDRESS}:{PORT}/"
 to-do
 - visually remove this file in root (NOT DELETE) or make undeletable instead, idk
 - ui looks like crap on desktop
-- btn is null when clicking on checkboxes
+- make CREDENTIALS more secure because what you're doing is complete ass
 
 done/implemented
 - add a password
@@ -75,6 +74,7 @@ done/implemented
 - show the list of the files to be uploaded instead of being crammed like that
 - how to make downloads faster
 - checkbox and zip for multi-download with the name of the directory
+- btn is null when clicking on checkboxes
 """
 
 class FileServerHandler(http.server.SimpleHTTPRequestHandler):
@@ -271,8 +271,7 @@ class FileServerHandler(http.server.SimpleHTTPRequestHandler):
 						content = f.read()
 
 					self.send_response(200)
-					self.send_header(
-						"Content-type", "text/plain; charset=utf-8")
+					self.send_header("Content-type", "text/plain; charset=utf-8")
 					self.end_headers()
 					self.wfile.write(content.encode("utf-8"))
 					return
@@ -282,8 +281,7 @@ class FileServerHandler(http.server.SimpleHTTPRequestHandler):
 
 		result = self.send_head()
 		if result:
-			# (file, size) - individual file
-			if isinstance(result, tuple):
+			if isinstance(result, tuple):	# (file, size) - individual file
 				f, total_size = result
 				try:
 					# microsoft edge case (pun?)
@@ -296,8 +294,7 @@ class FileServerHandler(http.server.SimpleHTTPRequestHandler):
 					self.wfile.flush()
 				finally:
 					f.close()
-			# directory listing
-			else:
+			else:	# directory listing
 				try:
 					shutil.copyfileobj(result, self.wfile)
 				finally:
@@ -361,7 +358,8 @@ class FileServerHandler(http.server.SimpleHTTPRequestHandler):
 			self.wfile.write(
 				f"data: {json.dumps(progress_data)}\n\n".encode("utf-8"))
 			self.wfile.flush()
-		
+
+
 		# check if client dced
 		def client_disconnected():
 			try:
@@ -372,6 +370,7 @@ class FileServerHandler(http.server.SimpleHTTPRequestHandler):
 			except (BrokenPipeError, ConnectionResetError, OSError):
 				return True
 
+
 		send_progress()	# initial
 
 		try:
@@ -379,7 +378,6 @@ class FileServerHandler(http.server.SimpleHTTPRequestHandler):
 			with zipfile.ZipFile(
 				zip_buffer, "w", zipfile.ZIP_DEFLATED, compresslevel=6
 			) as zf:
-				# i know `dirs` isn't used, i just put it there for clarity
 				for root, _, files in os.walk(path):
 					if client_disconnected():
 						cancelled = True
@@ -394,7 +392,7 @@ class FileServerHandler(http.server.SimpleHTTPRequestHandler):
 							file_size = os.path.getsize(full_path)
 							rel_path = os.path.relpath(
 								full_path, os.path.dirname(path)
-								).replace("\\", "/")
+							).replace("\\", "/")
 
 							zf.write(full_path, arcname=rel_path)
 							processed_bytes += file_size
@@ -432,10 +430,12 @@ class FileServerHandler(http.server.SimpleHTTPRequestHandler):
 			self.wfile.flush()
 
 
-	# https://en.wikipedia.org/wiki/Breadcrumb_navigation
-	# /root/path1/path2/path3/... where all the paths are clickable
 	def generate_breadcrumbs(self, path):
-		"""Generate breadcrumb HTML from current path."""
+		"""
+		Generate breadcrumb HTML from current path.
+		https://en.wikipedia.org/wiki/Breadcrumb_navigation
+		/root/path1/path2/path3/... where all the paths are clickable
+		"""
 		parts = [p for p in path.strip("/").split("/") if p]
 		breadcrumbs = []
 		# root link (always present)
@@ -450,7 +450,8 @@ class FileServerHandler(http.server.SimpleHTTPRequestHandler):
 			# full path up to this segment
 			full_http_path = "/" + "/".join(current_path_segments) + "/"
 			breadcrumbs.append(
-				f'<a href="{full_http_path}" class="breadcrumb-link">{display_name}</a>'
+				f'<a href="{full_http_path}" class="breadcrumb-link">'
+				f'{display_name}</a>'
 			)
 
 		return "/".join(breadcrumbs)
@@ -483,32 +484,25 @@ class FileServerHandler(http.server.SimpleHTTPRequestHandler):
 		listdir.sort(
 			key=lambda x: (not os.path.isdir(os.path.join(path, x)), x.lower()))
 
-		# why the hell would you write html, css, and js on a python file?
-		# move these to a separate html file?
-		# 2025/12/05 - don't
-		this_dir_temp = THIS_DIR.replace("\\", "/")
-		css_path = os.path.relpath("style.css", os.getcwd())
-		js_path = os.path.relpath("script.js", os.getcwd())
 		f.write(f"""
 		<!DOCTYPE html>
 		<html>
 			<head>
 				<meta charset="utf-8">
 				<meta name="viewport" content="width=device-width, initial-scale=1.0">
-				<link rel="icon" type="image/x-icon" href="https://img.icons8.com/?size=100&id=kktvCbkDLbNb&format=png&color=000000">
-				<link rel="stylesheet" type="text/css" href="/style.css">
+				<link rel="icon" type="image/x-icon" href="https://img.icons8.com/?id=kktvCbkDLbNb&format=png">
 				<title>files on https://{SERVER_DIRECTORY_IP_AND_PORT}</title>
+				<link rel="stylesheet" type="text/css" href="/style.css">
 				<script type="text/javascript" src="/script.js"></script>
 			</head>
 			<body>
 				<form method="post" enctype="multipart/form-data" action=".">
 					<input type="file" id="file-input" name="file" multiple onchange="toggleUpload()">
 					<div id="file-list"></div>
-					<input type="submit" id="upload-btn" value="Upload files" disabled style="width: 50%;">
+					<input type="submit" id="upload-btn" value="Upload files" disabled>
 				</form>
+				<h3>📁 {self.generate_breadcrumbs(self.path)}</h3>
 		""".encode("utf-8"))
-
-		f.write(f"<h3>📁 {self.generate_breadcrumbs(self.path)}</h3>".encode())
 
 		if self.path == "/" or self.path.strip("/") == "":
 			pass
@@ -523,16 +517,13 @@ class FileServerHandler(http.server.SimpleHTTPRequestHandler):
 			if parent_http == "//":
 				parent_http = "/"
 
-			f.write(f"""
-				<span>
-					<a href="{parent_http}" id="up-one-level" title="up one level">⬆️</a>
-					<button id="multi-download" disabled style="
-						padding:12px 20px; background:#007cba; color:white; border:none;
-						border-radius:6px; cursor:pointer; font-size:14px; font-weight:bold;
-					" onclick="downloadSelected()">⬇️ download selected (0)</button>
-				</span>""".encode("utf-8"))
+			f.write(f"""<a href="{parent_http}" id="up-one-level" title="up one level">⬆️</a>""".encode("utf-8"))
 
-		f.write(b"""<div id="download-status"></div>""")
+		f.write(f"""
+			<a id="multi-download" disabled onclick="downloadSelected()">
+				⬇️ download selected (0)
+			</a>
+			<div id="download-status"></div>""".encode("utf-8"))
 
 		directory_info = f"""
 			<ul>
@@ -540,7 +531,7 @@ class FileServerHandler(http.server.SimpleHTTPRequestHandler):
 				<li>Files: <b>{num_files}</b></li>
 				<li>Total items: <b>{total_items}</b></li>
 				<li>Total size: <b>{self.format_size(total_size_bytes)} ({total_size_bytes:,} bytes)</b></li>
-			</ul>""".encode()
+			</ul>""".encode("utf-8")
 
 		f.write(directory_info + b"""
 			<div><i>(refresh the page if changes do not reflect across devices)</i></div>
@@ -571,19 +562,22 @@ class FileServerHandler(http.server.SimpleHTTPRequestHandler):
 				f.write(f"""
 					<tr>
 						<td style="width:20px;text-align:center;">
-							<input type="checkbox" class="file-select" value="{urllib.parse.quote(item)}" 
-								data-type="{ 'dir' if os.path.isdir(fullname) else 'file' }"
+							<input type="checkbox" class="file-select"
+								value="{urllib.parse.quote(item)}" 
+								data-type="dir"
 								data-path="{urllib.parse.quote(fullname)}">
 						</td>
 						<td><div class="scrollable-cell">
-							<a href="{urllib.parse.quote(item)}/?download=1" class="directory-item" download title="Download {item} as ZIP">⬇️</a>
-							📁 <a href="{urllib.parse.quote(item)}/" class="directory-item"><b>{item}</b>/</a>
+							<a href="{urllib.parse.quote(item)}/?download=1"
+								class="directory-item"
+								download title="download {item} as zip">⬇️</a>
+							📁 <a href="{urllib.parse.quote(item)}/"
+								class="directory-item"><b>{item}</b>/</a>
 						</div></td>
 						<td>(folder)</td>
 						<td>{mod_date}</td>
 						<td>-</td>
-					</tr>""".encode()
-				)
+					</tr>""".encode("utf-8"))
 			elif os.path.isfile(fullname):
 				emoji = self.get_file_emoji(item)
 				size = self.format_size(os.path.getsize(fullname))
@@ -596,19 +590,22 @@ class FileServerHandler(http.server.SimpleHTTPRequestHandler):
 				f.write(f"""
 					<tr>
 						<td style="width:20px;text-align:center;">
-							<input type="checkbox" class="file-select" value="{urllib.parse.quote(item)}" 
-								data-type="{ 'dir' if os.path.isdir(fullname) else 'file' }"
+							<input type="checkbox" class="file-select"
+								value="{urllib.parse.quote(item)}" 
+								data-type="file"
 								data-path="{urllib.parse.quote(fullname)}">
 						</td>
 						<td><div class="scrollable-cell">
-							<a href="{encoded}?download=1/" class="directory-item" title="Download {item}">⬇️</a> {emoji} 
-							<a href="{encoded}" class="directory-item">{item}</a>
+							<a href="{encoded}?download=1/"
+								class="directory-item"
+								title="Download {item}">⬇️</a>
+							{emoji} <a href="{encoded}"
+								class="directory-item">{item}</a>
 						</div></td>
 						<td>{filetype}</td>
 						<td>{mod_date}</td>
 						<td title="{os.path.getsize(fullname):,} bytes">{size}</td>
-					</tr>""".encode()
-				)
+					</tr>""".encode("utf-8"))
 
 		f.write(b"</tbody></table></body></html>")
 		length = f.tell()
@@ -706,55 +703,43 @@ class FileServerHandler(http.server.SimpleHTTPRequestHandler):
 		# ".ts" extension
 		mapping = {
 			"image": {
-				".png", ".jpg", ".jpeg", ".gif",
-				".bmp", ".webp", ".svg", ".tiff",
-				".tif", ".ico", ".heif", ".jfif",
-				".raw"
+				".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".svg",
+				".tiff", ".tif", ".ico", ".heif", ".jfif", ".raw"
 			},
 			"video": {
-				".mp4", ".mkv", ".mov", ".wmv",
-				".flv", ".avi", ".webm", ".m4v",
+				".mp4", ".mkv", ".mov", ".wmv", ".flv", ".avi", ".webm", ".m4v",
 				".3gp", ".mpeg", ".mpg"
 			},
 			"audio": {
-				".mp3", ".flac", ".alac", ".ogg",
-				".wav", ".ape", ".aac", ".wma",
-				".midi", ".m4a", ".3gpp"
+				".mp3", ".flac", ".alac", ".ogg", ".wav", ".ape", ".aac",
+				".wma", ".midi", ".m4a", ".3gpp"
 			},
 			"doc": {
-				".pdf", ".docx", ".doc", ".xlsx",
-				".xls", ".pptx", ".ppt", ".epub",
-				".odt", ".ods", ".odp", ".tex",
-				".accdb"
+				".pdf", ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt",
+				".epub", ".odt", ".ods", ".odp", ".tex", ".accdb"
 			},
 			"text": {
-				".txt", ".rtf", ".md", ".csv",
-				".lrc", ".srt", ".ass"
+				".txt", ".rtf", ".md", ".csv", ".lrc", ".srt", ".ass"
 			},
 			"archive": {
-				".zip", ".rar", ".tar", ".7z",
-				".gz", ".bz2", ".xz", ".iso",
+				".zip", ".rar", ".tar", ".7z", ".gz", ".bz2", ".xz", ".iso",
 				".lzma", ".cab"
 			},
 			"code": {
-				".py", ".js", ".java", ".c",
-				".cpp", ".cs", ".rb", ".php",
-				".html", ".css", ".json", ".xml",
-				".sh", ".bat", ".pl", ".go",
-				".swift", ".ts", ".tsx", ".pyw"
+				".py", ".js", ".java", ".c", ".cpp", ".cs", ".rb", ".php",
+				".html", ".css", ".json", ".xml", ".sh", ".bat", ".pl", ".go",
+				".swift", ".ts", ".tsx", ".pyw", "htm"
 			},
 			"config": {
-				".ini", ".cfg", ".conf", ".config",
-				".yaml", ".yml", ".toml", ".properties"
+				".ini", ".cfg", ".conf", ".config", ".yaml", ".yml", ".toml",
+				".properties"
 			},
 			"exe": {
-				".exe", ".dll", ".bin", ".cmd",
-				".com", ".msi", ".apk", ".app",
+				".exe", ".dll", ".bin", ".cmd", ".com", ".msi", ".apk", ".app",
 				".deb", ".rpm", ".iso", ".sys"
 			},
 			"font": {
-				".ttf", ".otf", ".woff", ".woff2",
-				".eot"
+				".ttf", ".otf", ".woff", ".woff2", ".eot"
 			},
 			"rom": {
 				".nes", ".smc", ".sfc",	# NES/SNES (existing)
@@ -804,11 +789,11 @@ class FileServerHandler(http.server.SimpleHTTPRequestHandler):
 		# for example, (most) license files in github are just "LICENSE" and not
 		# "LICENSE.txt" or ".license", etc.
 		specials = {
-			"LICENSE": "license",
-			"LICENCE": "license",	# 🇬🇧
-			"README": "readme",
-			"MAKEFILE": "makefile",
-			"DOCKERFILE": "dockerfile"
+			"LICENSE":		"license",
+			"LICENCE":		"license",	# 🇬🇧
+			"README":		"readme",
+			"MAKEFILE":		"makefile",
+			"DOCKERFILE":	"dockerfile"
 		}
 
 		upper = name.upper()
@@ -871,19 +856,12 @@ class FileServerHandler(http.server.SimpleHTTPRequestHandler):
 		return None
 
 
-	def write_unbuffered(self, data):
-		self.connection.sendall(data)
-
-
-	def check_auth(self):
+	def require_auth(self) -> bool:
+		"""Checks if the user is authenticated."""
 		auth_header = self.headers.get("Authorization")
-		return auth_header == f"Basic {CREDENTIALS}"
-
-
-	def require_auth(self):
-		if not self.check_auth():
+		if not auth_header == f"Basic {CREDENTIALS}":
 			self.do_AUTHHEAD()
-			self.wfile.write(b'<h1>Access Denied >:)</h1>')
+			self.wfile.write(b"<h1>Access Denied >:)</h1>")
 			return False
 		return True
 

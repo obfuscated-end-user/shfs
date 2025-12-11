@@ -20,14 +20,16 @@ function toggleUpload() {
 	if (fileInput.files.length > 0) {
 		// add new files, skipping dupes by name
 		Array.from(fileInput.files).forEach(file => {
-			const exists = Array.from(dt.files).some(f => f.name === file.name && f.size === file.size);
+			const exists = Array.from(dt.files).some(
+				f => f.name === file.name && f.size === file.size);
 			if (!exists) dt.items.add(file);
 		});
 		fileInput.files = dt.files;	// update input to reflect current files
 	}
 	fileListContainer.innerHTML = "";
 	if (dt.files.length === 0) {
-		fileListContainer.innerHTML = `<em style="color:#999;">no files selected</em>`;
+		fileListContainer.innerHTML =
+			`<em style="color:#999;">no files selected</em>`;
 		uploadBtn.disabled = true;
 		return;
 	}
@@ -47,9 +49,8 @@ function toggleUpload() {
 			">✕</button>`;
 		fileListContainer.appendChild(fileItem);
 	});
-	fileListContainer.innerHTML += `<div style="font-weight:bold;margin-top:5px;color:#007cba;">
-		total: ${dt.files.length} file(s), ${formatBytes(totalSize)}
-	</div>`;
+	fileListContainer.innerHTML +=`<div style="font-weight:bold;margin-top:5px;color:#007cba;">
+		total: ${dt.files.length} file(s), ${formatBytes(totalSize)}</div>`;
 	// bind remove handlers
 	fileListContainer.querySelectorAll(".remove-file").forEach(btn => {
 		btn.onclick = function(e) {
@@ -72,10 +73,8 @@ let currentEventSource = null;
 let currentAbortController = null;
 
 function startDirDownload(dirLink) {
-	const dirName = dirLink.title?.replace("Download ", "")
-		|| dirLink.textContent.trim().replace("⬇️", "").trim();
-	const ssePath = dirLink.href.replace("?download=1", "")
-		+ "?sse=1";
+	const dirName = dirLink.title?.replace(/^(download )|(?: as zip)$/g, "");
+	const ssePath = dirLink.href.replace("?download=1", "") + "?sse=1";
 	const downloadPath = dirLink.href;
 	const container = document.getElementById("download-status");
 	currentAbortController = new AbortController();
@@ -111,7 +110,8 @@ function startDirDownload(dirLink) {
 		try {
 			const data = JSON.parse(event.data);
 			if (data.complete) {
-				container.innerHTML = `✅ "${dirName}.zip" ready (${formatBytes(data.size)})`;
+				container.innerHTML =
+					`✅ "${dirName}.zip" ready (${formatBytes(data.size)})`;
 				document.getElementById("cancel-btn")?.remove();
 				setTimeout(() => {
 					window.location.href = downloadPath;
@@ -169,8 +169,8 @@ document.addEventListener("click", function(e) {
 		const filename = downloadLink.title?.replace("Download ", "") || "file";
 		const container = document.getElementById("download-status");
 		container.innerHTML = `⏳ downloading "${filename}"...`;
-		container.style.display = 'block';
-		setTimeout(() => container.style.display = 'none', 25000);
+		container.style.display = "block";
+		setTimeout(() => container.style.display = "none", 25000);
 	}
 }, true);
 
@@ -183,33 +183,25 @@ function detectDevice() {
 	const deviceMemory = navigator.deviceMemory || "-1";
 	const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(ua);
 	const isTablet = /iPad|Android(?!.*Mobile)|Tablet/i.test(ua);
-
 	const deviceType = isMobile ? "Mobile" : (isTablet ? "Tablet" : "Desktop");
-
 	const browser = ua.includes("Chrome") ? "Chrome" :
 				ua.includes("Firefox") ? "Firefox" :
 				ua.includes("Safari") ? "Safari" :
 				ua.includes("Edge") ? "Edge" : "Other";
-	
+
 	const info = document.createElement("div");
 	info.id = "client-info";
 	info.style.cssText = `
 		background:#e8f4fd;padding:12px;border:1px solid #007cba;
 		border-radius:6px;margin:10px 0;font-size:13px;
-		font-family:monospace;
-	`;
+		font-family:monospace;`;
 	info.innerHTML = `
 		<strong>${deviceType}</strong> | 
 		${browser} on ${platform} | 
 		${screenRes} | 
 		${language} | 
-		RAM: ${deviceMemory}GB
-	`;
-	const serverInfo = document.querySelector('div[style*="background:#f0f8ff"]');
-	if (serverInfo)
-		serverInfo.parentNode.insertBefore(info, serverInfo.nextSibling);
-	else
-		document.body.insertBefore(info, document.body.firstChild);
+		RAM: ${deviceMemory}GB`;
+	document.body.insertBefore(info, document.body.firstChild);
 }
 
 // run on page load
@@ -221,7 +213,7 @@ else
 let selectedItems = new Set();
 
 function toggleAll(checkbox) {
-	document.querySelectorAll('.file-select').forEach(cb => {
+	document.querySelectorAll(".file-select").forEach(cb => {
 		cb.checked = checkbox.checked;
 	});
 	updateSelection();
@@ -229,20 +221,19 @@ function toggleAll(checkbox) {
 
 function updateSelection() {
 	selectedItems.clear();
-	document.querySelectorAll('.file-select:checked').forEach(cb => {
+	document.querySelectorAll(".file-select:checked").forEach(cb => {
 		selectedItems.add(cb.value);
 	});
 	const count = selectedItems.size;
-	const btn = document.getElementById('multi-download');
+	const btn = document.getElementById("multi-download");
 	btn.disabled = count === 0;
 	btn.textContent = `⬇️ download selected (${count})`;
 }
 
-// Add to existing document.addEventListener("click"...)
+// add to existing document.addEventListener("click"...)
 document.addEventListener("change", function(e) {
-	if (e.target.classList.contains('file-select')) {
+	if (e.target.classList.contains("file-select"))
 		updateSelection();
-	}
 });
 
 // multi-download function
@@ -276,6 +267,15 @@ function downloadSelected() {
 	document.body.appendChild(form);
 	form.submit();
 	document.body.removeChild(form);
+
+	document.querySelectorAll(".file-select").forEach(cb => {
+		cb.checked = false;
+	});
+	document.getElementById("select-all").checked = false;
+	selectedItems.clear();
+	const btn = document.getElementById("multi-download");
+	btn.disabled = true;
+	btn.textContent = "⬇️ download selected (0)";
 
 	// update status after delay
 	setTimeout(() => {
